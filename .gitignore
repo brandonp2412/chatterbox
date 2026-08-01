@@ -2,3 +2,4 @@ chatterbox
 *.log
 config.yaml
 vendor/
+.env
