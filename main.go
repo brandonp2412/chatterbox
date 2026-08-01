@@ -21,10 +21,10 @@ import (
 	_ "modernc.org/sqlite"
 
 	"go.mau.fi/whatsmeow"
-	waConsumer "go.mau.fi/whatsmeow/proto/waConsumerApplication"
 	waCommon "go.mau.fi/whatsmeow/proto/waCommon"
-	waEvents "go.mau.fi/whatsmeow/types/events"
+	waConsumer "go.mau.fi/whatsmeow/proto/waConsumerApplication"
 	waTypes "go.mau.fi/whatsmeow/types"
+	waEvents "go.mau.fi/whatsmeow/types/events"
 	pro "google.golang.org/protobuf/proto"
 
 	"go.mau.fi/mautrix-meta/pkg/messagix"
@@ -43,12 +43,14 @@ type rule struct {
 }
 
 type config struct {
-	Cookies   map[string]string `yaml:"cookies"`
-	Rules     []rule            `yaml:"rules"`
-	ReplyOnce bool              `yaml:"reply_once"`
-	Mode      string            `yaml:"mode"`
-	Proxy     string            `yaml:"proxy"`
-	LogLevel  string            `yaml:"log_level"`
+	Cookies              map[string]string `yaml:"cookies"`
+	Rules                []rule            `yaml:"rules"`
+	ReplyOnce            bool              `yaml:"reply_once"`
+	ReplyCooldownMinutes int               `yaml:"reply_cooldown_minutes"`
+	Mode                 string            `yaml:"mode"`
+	Proxy                string            `yaml:"proxy"`
+	LogLevel             string            `yaml:"log_level"`
+	DeepseekKey          string            `yaml:"deepseek_key"`
 }
 
 type logFilter struct {
@@ -87,10 +89,9 @@ func (f *logFilter) skip(p []byte) bool {
 }
 
 var defaultRules = []rule{
-	{Pattern: `(?i)(?:is this|still)\s+available`, Reply: "Hi, yes it's still available! Let me know if you have any questions."},
-	{Pattern: `(?i)(?:where|location|pick.?up)`, Reply: "I'm located in [city/area]. Pickup is available most days."},
-	{Pattern: `(?i)(?:price|how much|cost)`, Reply: "The price is listed in the ad. I'm open to reasonable offers."},
-	{Pattern: `(?i)(?:condition|used|new)`, Reply: "It's in great condition. Let me know if you'd like more photos."},
+	{Pattern: `(?i)(?:is this|still)\s+available`, Reply: "Yes, are you interested?"},
+	{Pattern: `(?i)(?:price|how much|cost)`, Reply: "The price is firm as listed in the ad."},
+	{Pattern: `(?i)(?:condition|used|new)`, Reply: "It's in good condition. Let me know if you'd like more photos."},
 }
 
 func main() {
@@ -104,6 +105,7 @@ func run() error {
 	selfTest := false
 	cfgPath := "config.yaml"
 	var testThread int64
+	devContactIDs := make(map[int64]bool)
 
 	args := os.Args[1:]
 	for i := 0; i < len(args); i++ {
@@ -121,6 +123,16 @@ func run() error {
 				return fmt.Errorf("invalid thread ID %q: %w", args[i], err)
 			}
 			testThread = v
+		case a == "--dev-contact":
+			i++
+			if i >= len(args) {
+				return fmt.Errorf("--dev-contact requires a contact/sender ID")
+			}
+			v, err := strconv.ParseInt(args[i], 10, 64)
+			if err != nil {
+				return fmt.Errorf("invalid contact ID %q: %w", args[i], err)
+			}
+			devContactIDs[v] = true
 		default:
 			cfgPath = a
 		}
@@ -171,7 +183,7 @@ func run() error {
 
 	ctx := context.Background()
 
-	userInfo, _, err := mc.LoadMessagesPage(ctx)
+	userInfo, initialTable, err := mc.LoadMessagesPage(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to load messages page: %w", err)
 	}
@@ -204,25 +216,36 @@ func run() error {
 		return fmt.Errorf("failed to prepare e2ee client: %w", err)
 	}
 
-	deepseekKey := os.Getenv("DEEPSEEK_API_KEY")
+	deepseekKey := cfg.DeepseekKey
+
+	replyCooldown := time.Duration(cfg.ReplyCooldownMinutes) * time.Minute
+	if replyCooldown <= 0 {
+		replyCooldown = 5 * time.Minute
+	}
 
 	bot := &bot{
-		log:            log,
-		client:         mc,
-		waClient:       waClient,
-		rules:          cfg.Rules,
-		replyOnce:      cfg.ReplyOnce && !selfTest,
-		replied:        make(map[int64]map[int]bool),
-		userID:         userInfo.GetFBID(),
-		selfTest:       selfTest,
-		startTime:      time.Now(),
-		userThreads:    make(map[int64]bool),
-		repliedThreads: make(map[int64]bool),
-		listings:       make(map[int64]*listing),
-		threadTypes:    make(map[int64]table.ThreadType),
-		deepseekKey:    deepseekKey,
-		httpClient:     &http.Client{Timeout: 30 * time.Second},
+		log:           log,
+		client:        mc,
+		waClient:      waClient,
+		rules:         cfg.Rules,
+		replyOnce:     cfg.ReplyOnce && !selfTest,
+		replied:       make(map[int64]map[int]bool),
+		userID:        userInfo.GetFBID(),
+		selfTest:      selfTest,
+		startTime:     time.Now(),
+		userThreads:   make(map[int64]bool),
+		lastReplyAt:   make(map[int64]time.Time),
+		replyCooldown: replyCooldown,
+		selfSentOtids: make(map[string]bool),
+		listings:      make(map[int64]*listing),
+		threadTypes:   make(map[int64]table.ThreadType),
+		contactNames:  make(map[int64]string),
+		devContacts:   devContactIDs,
+		deepseekKey:   deepseekKey,
+		httpClient:    &http.Client{Timeout: 30 * time.Second},
 	}
+
+	bot.recordThreadTypes(initialTable)
 
 	mc.SetEventHandler(bot.handleEvent)
 	waClient.AddEventHandler(bot.e2eeHandler)
@@ -279,11 +302,14 @@ type bot struct {
 	userID    int64
 	selfTest  bool
 
-	startTime      time.Time
-	userThreads    map[int64]bool
-	userThreadsMu  sync.Mutex
-	repliedThreads map[int64]bool
-	repliedMu      sync.Mutex
+	startTime     time.Time
+	userThreads   map[int64]bool
+	userThreadsMu sync.Mutex
+	lastReplyAt   map[int64]time.Time
+	replyCooldown time.Duration
+	repliedMu     sync.Mutex
+	selfSentOtids map[string]bool
+	selfSentMu    sync.Mutex
 
 	listings      map[int64]*listing
 	listingsMu    sync.RWMutex
@@ -291,6 +317,72 @@ type bot struct {
 	threadTypesMu sync.RWMutex
 	deepseekKey   string
 	httpClient    *http.Client
+
+	contactNames   map[int64]string
+	contactNamesMu sync.RWMutex
+	devContacts    map[int64]bool
+}
+
+func (b *bot) recordThreadTypes(tbl *table.LSTable) {
+	if tbl == nil {
+		return
+	}
+	b.log.Debug().
+		Int("delete_then_insert", len(tbl.LSDeleteThenInsertThread)).
+		Int("update_or_insert", len(tbl.LSUpdateOrInsertThread)).
+		Int("verify_exists", len(tbl.LSVerifyThreadExists)).
+		Msg("recordThreadTypes called")
+
+	set := func(source string, threadKey int64, tt table.ThreadType) {
+		existing, known := b.threadTypes[threadKey]
+		if known && existing != tt && tt == table.GROUP_THREAD && existing != table.GROUP_THREAD {
+			// LSVerifyThreadExists and similar lightweight "thread exists" pings report the
+			// generic GROUP_THREAD type even for threads we already know a more specific type
+			// for (e.g. MARKETPLACE). Don't let that clobber the specific type we already have.
+			b.log.Debug().
+				Str("source", source).
+				Int64("tid", threadKey).
+				Int64("existing_type", int64(existing)).
+				Int64("ignored_type", int64(tt)).
+				Msg("ignoring generic GROUP_THREAD downgrade of known thread type")
+			return
+		}
+		if known && existing != tt {
+			b.log.Debug().
+				Str("source", source).
+				Int64("tid", threadKey).
+				Int64("old_type", int64(existing)).
+				Int64("new_type", int64(tt)).
+				Msg("thread type changed")
+		}
+		b.threadTypes[threadKey] = tt
+	}
+
+	b.threadTypesMu.Lock()
+	for _, t := range tbl.LSDeleteThenInsertThread {
+		set("LSDeleteThenInsertThread", t.ThreadKey, t.ThreadType)
+	}
+	for _, t := range tbl.LSUpdateOrInsertThread {
+		set("LSUpdateOrInsertThread", t.ThreadKey, t.ThreadType)
+	}
+	for _, cta := range tbl.LSInsertAttachmentCta {
+		// Brand new marketplace threads never get a LSDeleteThenInsertThread/LSUpdateOrInsertThread
+		// event over the live socket - the only thread-type signal we ever see for them is the
+		// generic LSVerifyThreadExists ping (ThreadType=GROUP_THREAD). Marketplace's own "quick
+		// reply" CTAs (Yes / In talks / Not available) are only ever attached to marketplace
+		// inquiry threads, so treat their presence as authoritative proof of MARKETPLACE type.
+		if cta.Type_ == "marketplace_xma_call_function" {
+			b.log.Debug().
+				Str("source", "LSInsertAttachmentCta").
+				Int64("tid", cta.ThreadKey).
+				Msg("marking thread as marketplace from quick-reply CTA")
+			b.threadTypes[cta.ThreadKey] = table.MARKETPLACE
+		}
+	}
+	for _, t := range tbl.LSVerifyThreadExists {
+		set("LSVerifyThreadExists", t.ThreadKey, t.ThreadType)
+	}
+	b.threadTypesMu.Unlock()
 }
 
 func (b *bot) handleEvent(ctx context.Context, evt any) {
@@ -302,30 +394,39 @@ func (b *bot) handleEvent(ctx context.Context, evt any) {
 		return
 	}
 
-	b.threadTypesMu.Lock()
-	for _, t := range tbl.LSDeleteThenInsertThread {
-		b.threadTypes[t.ThreadKey] = t.ThreadType
-	}
-	for _, t := range tbl.LSUpdateOrInsertThread {
-		b.threadTypes[t.ThreadKey] = t.ThreadType
-	}
-	for _, t := range tbl.LSVerifyThreadExists {
-		b.threadTypes[t.ThreadKey] = t.ThreadType
-	}
-	b.threadTypesMu.Unlock()
+	b.log.Debug().Interface("table", tbl).Msg("dump of raw event table")
+	b.recordThreadTypes(tbl)
 
+	if len(tbl.LSVerifyContactRowExists) > 0 {
+		b.contactNamesMu.Lock()
+		for _, c := range tbl.LSVerifyContactRowExists {
+			if c.Name != "" {
+				b.contactNames[c.ContactId] = c.Name
+			}
+		}
+		b.contactNamesMu.Unlock()
+	}
+
+	b.selfSentMu.Lock()
+	isSelfSent := func(otid string) bool {
+		if otid == "" {
+			return false
+		}
+		return b.selfSentOtids[otid]
+	}
 	b.userThreadsMu.Lock()
 	for _, msg := range tbl.LSUpsertMessage {
-		if msg.SenderId == b.userID {
+		if msg.SenderId == b.userID && !isSelfSent(msg.OfflineThreadingId) {
 			b.userThreads[msg.ThreadKey] = true
 		}
 	}
 	for _, msg := range tbl.LSInsertMessage {
-		if msg.SenderId == b.userID {
+		if msg.SenderId == b.userID && !isSelfSent(msg.OfflineThreadingId) {
 			b.userThreads[msg.ThreadKey] = true
 		}
 	}
 	b.userThreadsMu.Unlock()
+	b.selfSentMu.Unlock()
 
 	upsert, insert := tbl.WrapMessages()
 	count := len(insert)
@@ -400,28 +501,57 @@ func (b *bot) marketplaceThread(threadKey int64) bool {
 	return ok && tt == table.MARKETPLACE
 }
 
+// devTestSender reports whether, in --dev testing mode, msg comes from a contact whose
+// name contains "Brandon", or whose ID was explicitly allow-listed via --dev-contact -
+// lets personal test messages through without a marketplace listing.
+func (b *bot) devTestSender(senderId int64) bool {
+	if b.devContacts[senderId] {
+		return true
+	}
+	b.contactNamesMu.RLock()
+	name := b.contactNames[senderId]
+	b.contactNamesMu.RUnlock()
+	return strings.Contains(strings.ToLower(name), "brandon")
+}
+
 func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 	threadID := msg.ThreadKey
 
-	if !b.marketplaceThread(threadID) {
+	if !b.marketplaceThread(threadID) && !(b.selfTest && b.devTestSender(msg.SenderId)) {
+		b.threadTypesMu.RLock()
+		tt, known := b.threadTypes[threadID]
+		mapSize := len(b.threadTypes)
+		b.threadTypesMu.RUnlock()
+		b.log.Info().
+			Int64("tid", threadID).
+			Bool("type_known", known).
+			Int64("type", int64(tt)).
+			Int("known_thread_count", mapSize).
+			Msg("skipping non-marketplace thread")
+		b.log.Debug().Interface("msg", msg).Msg("dump of skipped message")
 		return
 	}
 
-	if msg.TimestampMs < b.startTime.UnixMilli() {
+	if msg.TimestampMs < b.startTime.Add(-2*time.Minute).UnixMilli() {
+		b.log.Info().Int64("tid", threadID).Int64("ts", msg.TimestampMs).Msg("skipping old message")
 		return
 	}
 
-	b.userThreadsMu.Lock()
-	userSent := b.userThreads[threadID]
-	b.userThreadsMu.Unlock()
-	if userSent {
-		return
+	if !b.selfTest {
+		b.userThreadsMu.Lock()
+		userSent := b.userThreads[threadID]
+		b.userThreadsMu.Unlock()
+		if userSent {
+			b.log.Info().Int64("tid", threadID).Msg("skipping user-participated thread")
+			return
+		}
 	}
 
 	b.repliedMu.Lock()
-	alreadyReplied := b.repliedThreads[threadID]
+	last, onCooldown := b.lastReplyAt[threadID]
 	b.repliedMu.Unlock()
-	if alreadyReplied {
+	if onCooldown && time.Since(last) < b.replyCooldown {
+		b.log.Info().Int64("tid", threadID).Time("last_reply", last).Msg("skipping thread on reply cooldown")
 		return
 	}
 
@@ -439,19 +569,24 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 	}
 
 	if !b.selfTest && msg.SenderId == b.userID {
-		b.userThreadsMu.Lock()
-		b.userThreads[threadID] = true
-		b.userThreadsMu.Unlock()
+		b.selfSentMu.Lock()
+		selfSent := msg.OfflineThreadingId != "" && b.selfSentOtids[msg.OfflineThreadingId]
+		b.selfSentMu.Unlock()
+		if !selfSent {
+			b.userThreadsMu.Lock()
+			b.userThreads[threadID] = true
+			b.userThreadsMu.Unlock()
+		}
 		return
 	}
 
 	text := msg.Text
-	if text == "" && l == nil {
-		b.log.Debug().Int64("tid", threadID).Int64("sid", msg.SenderId).Msg("empty text, skipped")
+	if text == "" {
+		b.log.Info().Int64("tid", threadID).Int64("sid", msg.SenderId).Bool("admin", msg.IsAdminMessage).Msg("skipping empty message")
 		return
 	}
 
-	b.log.Debug().
+	b.log.Info().
 		Int64("sid", msg.SenderId).
 		Int64("tid", threadID).
 		Str("text", text).
@@ -464,7 +599,7 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 		} else if reply != "" {
 			b.log.Info().Str("reply", reply).Msg("deepseek reply")
 			b.repliedMu.Lock()
-			b.repliedThreads[threadID] = true
+			b.lastReplyAt[threadID] = time.Now()
 			b.repliedMu.Unlock()
 			b.sendReply(ctx, threadID, reply)
 			return
@@ -491,13 +626,13 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 				Msg("auto-replying")
 
 			b.repliedMu.Lock()
-			b.repliedThreads[threadID] = true
+			b.lastReplyAt[threadID] = time.Now()
 			b.repliedMu.Unlock()
 			b.sendReply(ctx, threadID, rule.Reply)
 			return
 		}
 	}
-	b.log.Debug().Int64("tid", threadID).Str("text", text).Msg("no rule matched")
+	b.log.Info().Int64("tid", threadID).Str("text", text).Msg("no rule matched")
 }
 
 type deepseekMessage struct {
@@ -580,15 +715,20 @@ func (b *bot) markThreadRead(ctx context.Context, threadID int64) {
 }
 
 func (b *bot) sendReply(ctx context.Context, threadID int64, text string) {
+	otid := methods.GenerateEpochID()
 	task := &socket.SendMessageTask{
 		ThreadId:         threadID,
-		Otid:             methods.GenerateEpochID(),
+		Otid:             otid,
 		Source:           table.MESSENGER_INBOX_IN_THREAD,
 		InitiatingSource: table.FACEBOOK_INBOX,
 		SendType:         table.TEXT,
 		SyncGroup:        1,
 		Text:             text,
 	}
+
+	b.selfSentMu.Lock()
+	b.selfSentOtids[strconv.FormatInt(otid, 10)] = true
+	b.selfSentMu.Unlock()
 
 	if _, err := b.client.ExecuteTasks(ctx, task); err != nil {
 		b.log.Err(err).Msg("Failed to send reply")
@@ -634,37 +774,57 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 		return
 	}
 
-	if !b.marketplaceThread(tid) {
+	b.contactNamesMu.RLock()
+	cachedName := b.contactNames[sid]
+	b.contactNamesMu.RUnlock()
+	devTest := b.selfTest && (b.devTestSender(sid) || strings.Contains(strings.ToLower(fbMsg.Info.PushName), "brandon"))
+	if !b.marketplaceThread(tid) && !devTest {
+		b.log.Info().
+			Int64("sid", sid).
+			Int64("tid", tid).
+			Bool("self_test", b.selfTest).
+			Bool("dev_contact_match", b.devContacts[sid]).
+			Int("dev_contact_count", len(b.devContacts)).
+			Str("push_name", fbMsg.Info.PushName).
+			Str("cached_contact_name", cachedName).
+			Msg("e2ee: skipping non-marketplace/non-devtest thread")
 		return
 	}
 
 	if fbMsg.Info.Timestamp.Before(b.startTime) {
+		b.log.Info().Int64("tid", tid).Time("msg_ts", fbMsg.Info.Timestamp).Time("start_ts", b.startTime).Msg("e2ee: skipping old message")
 		return
 	}
 
 	if fbMsg.Info.IsFromMe {
+		b.log.Info().Int64("tid", tid).Msg("e2ee: message from self, marking userThreads")
 		b.userThreadsMu.Lock()
 		b.userThreads[tid] = true
 		b.userThreadsMu.Unlock()
 		return
 	}
 
-	b.userThreadsMu.Lock()
-	userSent := b.userThreads[tid]
-	b.userThreadsMu.Unlock()
-	if userSent {
-		return
+	if !b.selfTest {
+		b.userThreadsMu.Lock()
+		userSent := b.userThreads[tid]
+		b.userThreadsMu.Unlock()
+		if userSent {
+			b.log.Info().Int64("tid", tid).Msg("e2ee: skipping user-participated thread")
+			return
+		}
 	}
 
 	b.repliedMu.Lock()
-	alreadyReplied := b.repliedThreads[tid]
+	last, onCooldown := b.lastReplyAt[tid]
 	b.repliedMu.Unlock()
-	if alreadyReplied {
+	if onCooldown && time.Since(last) < b.replyCooldown {
+		b.log.Info().Int64("tid", tid).Time("last_reply", last).Msg("e2ee: skipping thread on reply cooldown")
 		return
 	}
 
 	content := consumerApp.GetPayload().GetContent()
 	if content == nil {
+		b.log.Info().Int64("tid", tid).Msg("e2ee: nil content, skipping")
 		return
 	}
 
@@ -678,10 +838,11 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 	}
 
 	if text == "" {
+		b.log.Info().Int64("tid", tid).Str("content_type", fmt.Sprintf("%T", content.GetContent())).Msg("e2ee: empty text, skipping")
 		return
 	}
 
-	b.log.Debug().
+	b.log.Info().
 		Int64("sid", sid).
 		Int64("tid", tid).
 		Str("text", text).
@@ -698,7 +859,7 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 		} else if reply != "" {
 			b.log.Info().Str("reply", reply).Msg("deepseek reply (e2ee)")
 			b.repliedMu.Lock()
-			b.repliedThreads[tid] = true
+			b.lastReplyAt[tid] = time.Now()
 			b.repliedMu.Unlock()
 			b.sendE2EEReply(fbMsg.Info.Chat, tid, reply)
 			return
@@ -725,13 +886,13 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 				Msg("auto-replying (e2ee)")
 
 			b.repliedMu.Lock()
-			b.repliedThreads[tid] = true
+			b.lastReplyAt[tid] = time.Now()
 			b.repliedMu.Unlock()
 			b.sendE2EEReply(fbMsg.Info.Chat, tid, rule.Reply)
 			return
 		}
 	}
-	b.log.Debug().Int64("tid", tid).Str("text", text).Msg("e2ee no rule matched")
+	b.log.Info().Int64("tid", tid).Str("text", text).Msg("e2ee no rule matched")
 }
 
 func (b *bot) sendE2EEReply(chatJID waTypes.JID, threadID int64, text string) {
