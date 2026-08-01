@@ -207,18 +207,21 @@ func run() error {
 	deepseekKey := os.Getenv("DEEPSEEK_API_KEY")
 
 	bot := &bot{
-		log:          log,
-		client:       mc,
-		waClient:     waClient,
-		rules:        cfg.Rules,
-		replyOnce:    cfg.ReplyOnce && !selfTest,
-		replied:      make(map[int64]map[int]bool),
-		userID:       userInfo.GetFBID(),
-		selfTest:     selfTest,
-		listings:     make(map[int64]*listing),
-		threadTypes:  make(map[int64]table.ThreadType),
-		deepseekKey:  deepseekKey,
-		httpClient:   &http.Client{Timeout: 30 * time.Second},
+		log:            log,
+		client:         mc,
+		waClient:       waClient,
+		rules:          cfg.Rules,
+		replyOnce:      cfg.ReplyOnce && !selfTest,
+		replied:        make(map[int64]map[int]bool),
+		userID:         userInfo.GetFBID(),
+		selfTest:       selfTest,
+		startTime:      time.Now(),
+		userThreads:    make(map[int64]bool),
+		repliedThreads: make(map[int64]bool),
+		listings:       make(map[int64]*listing),
+		threadTypes:    make(map[int64]table.ThreadType),
+		deepseekKey:    deepseekKey,
+		httpClient:     &http.Client{Timeout: 30 * time.Second},
 	}
 
 	mc.SetEventHandler(bot.handleEvent)
@@ -276,6 +279,12 @@ type bot struct {
 	userID    int64
 	selfTest  bool
 
+	startTime      time.Time
+	userThreads    map[int64]bool
+	userThreadsMu  sync.Mutex
+	repliedThreads map[int64]bool
+	repliedMu      sync.Mutex
+
 	listings      map[int64]*listing
 	listingsMu    sync.RWMutex
 	threadTypes   map[int64]table.ThreadType
@@ -285,8 +294,11 @@ type bot struct {
 }
 
 func (b *bot) handleEvent(ctx context.Context, evt any) {
-	tbl, ok := evt.(*table.LSTable)
-	if !ok {
+	var tbl *table.LSTable
+	switch e := evt.(type) {
+	case *messagix.Event_PublishResponse:
+		tbl = e.Table
+	default:
 		return
 	}
 
@@ -301,6 +313,19 @@ func (b *bot) handleEvent(ctx context.Context, evt any) {
 		b.threadTypes[t.ThreadKey] = t.ThreadType
 	}
 	b.threadTypesMu.Unlock()
+
+	b.userThreadsMu.Lock()
+	for _, msg := range tbl.LSUpsertMessage {
+		if msg.SenderId == b.userID {
+			b.userThreads[msg.ThreadKey] = true
+		}
+	}
+	for _, msg := range tbl.LSInsertMessage {
+		if msg.SenderId == b.userID {
+			b.userThreads[msg.ThreadKey] = true
+		}
+	}
+	b.userThreadsMu.Unlock()
 
 	upsert, insert := tbl.WrapMessages()
 	count := len(insert)
@@ -382,6 +407,24 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 		return
 	}
 
+	if msg.TimestampMs < b.startTime.UnixMilli() {
+		return
+	}
+
+	b.userThreadsMu.Lock()
+	userSent := b.userThreads[threadID]
+	b.userThreadsMu.Unlock()
+	if userSent {
+		return
+	}
+
+	b.repliedMu.Lock()
+	alreadyReplied := b.repliedThreads[threadID]
+	b.repliedMu.Unlock()
+	if alreadyReplied {
+		return
+	}
+
 	l := b.extractListing(msg)
 	if l != nil {
 		b.log.Info().
@@ -396,6 +439,9 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 	}
 
 	if !b.selfTest && msg.SenderId == b.userID {
+		b.userThreadsMu.Lock()
+		b.userThreads[threadID] = true
+		b.userThreadsMu.Unlock()
 		return
 	}
 
@@ -417,6 +463,9 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 			b.log.Err(err).Msg("deepseek call failed, falling back to rules")
 		} else if reply != "" {
 			b.log.Info().Str("reply", reply).Msg("deepseek reply")
+			b.repliedMu.Lock()
+			b.repliedThreads[threadID] = true
+			b.repliedMu.Unlock()
 			b.sendReply(ctx, threadID, reply)
 			return
 		}
@@ -441,6 +490,9 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 				Str("pattern", rule.Pattern).
 				Msg("auto-replying")
 
+			b.repliedMu.Lock()
+			b.repliedThreads[threadID] = true
+			b.repliedMu.Unlock()
 			b.sendReply(ctx, threadID, rule.Reply)
 			return
 		}
@@ -538,7 +590,7 @@ func (b *bot) sendReply(ctx context.Context, threadID int64, text string) {
 		Text:             text,
 	}
 
-	if err := b.client.ExecuteStatelessTask(ctx, task); err != nil {
+	if _, err := b.client.ExecuteTasks(ctx, task); err != nil {
 		b.log.Err(err).Msg("Failed to send reply")
 		return
 	}
@@ -586,6 +638,31 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 		return
 	}
 
+	if fbMsg.Info.Timestamp.Before(b.startTime) {
+		return
+	}
+
+	if fbMsg.Info.IsFromMe {
+		b.userThreadsMu.Lock()
+		b.userThreads[tid] = true
+		b.userThreadsMu.Unlock()
+		return
+	}
+
+	b.userThreadsMu.Lock()
+	userSent := b.userThreads[tid]
+	b.userThreadsMu.Unlock()
+	if userSent {
+		return
+	}
+
+	b.repliedMu.Lock()
+	alreadyReplied := b.repliedThreads[tid]
+	b.repliedMu.Unlock()
+	if alreadyReplied {
+		return
+	}
+
 	content := consumerApp.GetPayload().GetContent()
 	if content == nil {
 		return
@@ -601,10 +678,6 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 	}
 
 	if text == "" {
-		return
-	}
-
-	if fbMsg.Info.IsFromMe {
 		return
 	}
 
@@ -624,6 +697,9 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 			b.log.Err(err).Msg("deepseek call failed (e2ee), falling back to rules")
 		} else if reply != "" {
 			b.log.Info().Str("reply", reply).Msg("deepseek reply (e2ee)")
+			b.repliedMu.Lock()
+			b.repliedThreads[tid] = true
+			b.repliedMu.Unlock()
 			b.sendE2EEReply(fbMsg.Info.Chat, tid, reply)
 			return
 		}
@@ -648,6 +724,9 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 				Str("pattern", rule.Pattern).
 				Msg("auto-replying (e2ee)")
 
+			b.repliedMu.Lock()
+			b.repliedThreads[tid] = true
+			b.repliedMu.Unlock()
 			b.sendE2EEReply(fbMsg.Info.Chat, tid, rule.Reply)
 			return
 		}
