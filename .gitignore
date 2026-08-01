@@ -3,3 +3,4 @@ chatterbox
 config.yaml
 vendor/
 .env
+device.db

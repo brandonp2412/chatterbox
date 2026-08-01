@@ -51,6 +51,41 @@ type config struct {
 	LogLevel  string            `yaml:"log_level"`
 }
 
+type logFilter struct {
+	out io.Writer
+}
+
+func (f *logFilter) Write(p []byte) (n int, err error) {
+	if f.skip(p) {
+		return len(p), nil
+	}
+	return f.out.Write(p)
+}
+
+func (f *logFilter) WriteLevel(lvl zerolog.Level, p []byte) (n int, err error) {
+	if f.skip(p) {
+		return len(p), nil
+	}
+	if lw, ok := f.out.(zerolog.LevelWriter); ok {
+		return lw.WriteLevel(lvl, p)
+	}
+	return f.out.Write(p)
+}
+
+var skipPatterns = [][]byte{
+	[]byte("Skipping dependency with no reference"),
+	[]byte("Failed to set int64"),
+}
+
+func (f *logFilter) skip(p []byte) bool {
+	for _, pat := range skipPatterns {
+		if bytes.Contains(p, pat) {
+			return true
+		}
+	}
+	return false
+}
+
 var defaultRules = []rule{
 	{Pattern: `(?i)(?:is this|still)\s+available`, Reply: "Hi, yes it's still available! Let me know if you have any questions."},
 	{Pattern: `(?i)(?:where|location|pick.?up)`, Reply: "I'm located in [city/area]. Pickup is available most days."},
@@ -81,7 +116,11 @@ func run() error {
 			if i >= len(args) {
 				return fmt.Errorf("--test requires a thread ID")
 			}
-			testThread, _ = strconv.ParseInt(args[i], 10, 64)
+			v, err := strconv.ParseInt(args[i], 10, 64)
+			if err != nil {
+				return fmt.Errorf("invalid thread ID %q: %w", args[i], err)
+			}
+			testThread = v
 		default:
 			cfgPath = a
 		}
@@ -93,7 +132,11 @@ func run() error {
 	}
 
 	for i := range cfg.Rules {
-		cfg.Rules[i].compiled = regexp.MustCompile(cfg.Rules[i].Pattern)
+		re, err := regexp.Compile(cfg.Rules[i].Pattern)
+		if err != nil {
+			return fmt.Errorf("invalid regex pattern %q: %w", cfg.Rules[i].Pattern, err)
+		}
+		cfg.Rules[i].compiled = re
 	}
 
 	lvl, err := zerolog.ParseLevel(cfg.LogLevel)
@@ -103,7 +146,7 @@ func run() error {
 	if selfTest && lvl < zerolog.DebugLevel {
 		lvl = zerolog.DebugLevel
 	}
-	log := zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: "3:04PM"}).Level(lvl).With().Timestamp().Logger()
+	log := zerolog.New(&logFilter{out: zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: "3:04PM"}}).Level(lvl).With().Timestamp().Logger()
 
 	mode := types.PlatformFromString(cfg.Mode)
 	if mode == types.Unset {
@@ -362,7 +405,7 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 		return
 	}
 
-	b.log.Info().
+	b.log.Debug().
 		Int64("sid", msg.SenderId).
 		Int64("tid", threadID).
 		Str("text", text).
@@ -393,11 +436,10 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 				rset[i] = true
 			}
 
-			b.log.Info().
+			b.log.Debug().
 				Int64("thread", threadID).
 				Str("pattern", rule.Pattern).
-				Str("message", text).
-				Msg("Auto-replying")
+				Msg("auto-replying")
 
 			b.sendReply(ctx, threadID, rule.Reply)
 			return
@@ -456,7 +498,11 @@ func (b *bot) callDeepseek(systemPrompt, userMessage string) (string, error) {
 	}
 
 	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("deepseek api error %d: %s", resp.StatusCode, string(respBody))
+		trunc := string(respBody)
+		if len(trunc) > 200 {
+			trunc = trunc[:200] + "..."
+		}
+		return "", fmt.Errorf("deepseek api error %d: %s", resp.StatusCode, trunc)
 	}
 
 	var ds deepseekResponse
@@ -468,6 +514,17 @@ func (b *bot) callDeepseek(systemPrompt, userMessage string) (string, error) {
 	}
 
 	return strings.TrimSpace(ds.Choices[0].Message.Content), nil
+}
+
+func (b *bot) markThreadRead(ctx context.Context, threadID int64) {
+	task := &socket.ThreadMarkReadTask{
+		ThreadId:            threadID,
+		LastReadWatermarkTs: time.Now().UnixMilli(),
+		SyncGroup:           1,
+	}
+	if _, err := b.client.ExecuteTasks(ctx, task); err != nil {
+		b.log.Err(err).Int64("tid", threadID).Msg("failed to mark thread read")
+	}
 }
 
 func (b *bot) sendReply(ctx context.Context, threadID int64, text string) {
@@ -486,6 +543,7 @@ func (b *bot) sendReply(ctx context.Context, threadID int64, text string) {
 		return
 	}
 	b.log.Info().Msg("reply sent")
+	b.markThreadRead(ctx, threadID)
 }
 
 func (b *bot) e2eeHandler(evt any) {
@@ -513,8 +571,16 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 		return
 	}
 
-	sid, _ := strconv.ParseInt(fbMsg.Info.Sender.User, 10, 64)
-	tid, _ := strconv.ParseInt(fbMsg.Info.Chat.User, 10, 64)
+	sid, err := strconv.ParseInt(fbMsg.Info.Sender.User, 10, 64)
+	if err != nil {
+		b.log.Warn().Err(err).Str("user", fbMsg.Info.Sender.User).Msg("invalid sender JID")
+		return
+	}
+	tid, err := strconv.ParseInt(fbMsg.Info.Chat.User, 10, 64)
+	if err != nil {
+		b.log.Warn().Err(err).Str("user", fbMsg.Info.Chat.User).Msg("invalid chat JID")
+		return
+	}
 
 	if !b.marketplaceThread(tid) {
 		return
@@ -542,7 +608,7 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 		return
 	}
 
-	b.log.Info().
+	b.log.Debug().
 		Int64("sid", sid).
 		Int64("tid", tid).
 		Str("text", text).
@@ -558,7 +624,7 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 			b.log.Err(err).Msg("deepseek call failed (e2ee), falling back to rules")
 		} else if reply != "" {
 			b.log.Info().Str("reply", reply).Msg("deepseek reply (e2ee)")
-			b.sendE2EEReply(fbMsg.Info.Chat, reply)
+			b.sendE2EEReply(fbMsg.Info.Chat, tid, reply)
 			return
 		}
 	}
@@ -577,20 +643,19 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 				rset[i] = true
 			}
 
-			b.log.Info().
+			b.log.Debug().
 				Int64("thread", tid).
 				Str("pattern", rule.Pattern).
-				Str("message", text).
-				Msg("Auto-replying (e2ee)")
+				Msg("auto-replying (e2ee)")
 
-			b.sendE2EEReply(fbMsg.Info.Chat, rule.Reply)
+			b.sendE2EEReply(fbMsg.Info.Chat, tid, rule.Reply)
 			return
 		}
 	}
 	b.log.Debug().Int64("tid", tid).Str("text", text).Msg("e2ee no rule matched")
 }
 
-func (b *bot) sendE2EEReply(chatJID waTypes.JID, text string) {
+func (b *bot) sendE2EEReply(chatJID waTypes.JID, threadID int64, text string) {
 	if b.waClient == nil {
 		b.log.Warn().Msg("no e2ee client, cannot reply")
 		return
@@ -613,6 +678,7 @@ func (b *bot) sendE2EEReply(chatJID waTypes.JID, text string) {
 		return
 	}
 	b.log.Info().Msg("e2ee reply sent")
+	b.markThreadRead(context.Background(), threadID)
 }
 
 func loadConfig(path string) (*config, error) {
