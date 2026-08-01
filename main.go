@@ -1,12 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/signal"
 	"regexp"
 	"strconv"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -155,15 +161,21 @@ func run() error {
 		return fmt.Errorf("failed to prepare e2ee client: %w", err)
 	}
 
+	deepseekKey := os.Getenv("DEEPSEEK_API_KEY")
+
 	bot := &bot{
-		log:       log,
-		client:    mc,
-		waClient:  waClient,
-		rules:     cfg.Rules,
-		replyOnce: cfg.ReplyOnce && !selfTest,
-		replied:   make(map[int64]map[int]bool),
-		userID:    userInfo.GetFBID(),
-		selfTest:  selfTest,
+		log:          log,
+		client:       mc,
+		waClient:     waClient,
+		rules:        cfg.Rules,
+		replyOnce:    cfg.ReplyOnce && !selfTest,
+		replied:      make(map[int64]map[int]bool),
+		userID:       userInfo.GetFBID(),
+		selfTest:     selfTest,
+		listings:     make(map[int64]*listing),
+		threadTypes:  make(map[int64]table.ThreadType),
+		deepseekKey:  deepseekKey,
+		httpClient:   &http.Client{Timeout: 30 * time.Second},
 	}
 
 	mc.SetEventHandler(bot.handleEvent)
@@ -203,6 +215,14 @@ func run() error {
 	return nil
 }
 
+type listing struct {
+	Title       string
+	Subtitle    string
+	Description string
+	Source      string
+	ActionURL   string
+}
+
 type bot struct {
 	log       zerolog.Logger
 	client    *messagix.Client
@@ -212,6 +232,13 @@ type bot struct {
 	replied   map[int64]map[int]bool
 	userID    int64
 	selfTest  bool
+
+	listings      map[int64]*listing
+	listingsMu    sync.RWMutex
+	threadTypes   map[int64]table.ThreadType
+	threadTypesMu sync.RWMutex
+	deepseekKey   string
+	httpClient    *http.Client
 }
 
 func (b *bot) handleEvent(ctx context.Context, evt any) {
@@ -219,6 +246,18 @@ func (b *bot) handleEvent(ctx context.Context, evt any) {
 	if !ok {
 		return
 	}
+
+	b.threadTypesMu.Lock()
+	for _, t := range tbl.LSDeleteThenInsertThread {
+		b.threadTypes[t.ThreadKey] = t.ThreadType
+	}
+	for _, t := range tbl.LSUpdateOrInsertThread {
+		b.threadTypes[t.ThreadKey] = t.ThreadType
+	}
+	for _, t := range tbl.LSVerifyThreadExists {
+		b.threadTypes[t.ThreadKey] = t.ThreadType
+	}
+	b.threadTypesMu.Unlock()
 
 	upsert, insert := tbl.WrapMessages()
 	count := len(insert)
@@ -239,24 +278,106 @@ func (b *bot) handleEvent(ctx context.Context, evt any) {
 	}
 }
 
+func (b *bot) extractListing(msg *table.WrappedMessage) *listing {
+	for _, xma := range msg.XMAAttachments {
+		if xma.TitleText == "" && xma.DescriptionText == "" {
+			continue
+		}
+		l := &listing{
+			Title:       xma.TitleText,
+			Subtitle:    xma.SubtitleText,
+			Description: xma.DescriptionText,
+			Source:      xma.SourceText,
+			ActionURL:   xma.ActionUrl,
+		}
+		if xma.CTA != nil && xma.CTA.ActionUrl != "" {
+			l.ActionURL = xma.CTA.ActionUrl
+		}
+		return l
+	}
+	for _, att := range msg.Attachments {
+		if att.TitleText == "" && att.DescriptionText == "" {
+			continue
+		}
+		return &listing{
+			Title:       att.TitleText,
+			Subtitle:    att.SubtitleText,
+			Description: att.DescriptionText,
+			Source:      att.SourceText,
+			ActionURL:   att.ActionUrl,
+		}
+	}
+	return nil
+}
+
+func (b *bot) buildPrompt(threadID int64) string {
+	b.listingsMu.RLock()
+	lk := b.listings[threadID]
+	b.listingsMu.RUnlock()
+
+	if lk == nil {
+		return "You are a helpful seller on Facebook Marketplace responding to a buyer's inquiry. Reply briefly in 1 sentence. Do NOT sign off with your name."
+	}
+	return fmt.Sprintf(
+		"You are a helpful seller on Facebook Marketplace. You listed:\nTitle: %s\nPrice/Location: %s\nDescription: %s\nSource: %s\n\n"+
+			"A buyer is messaging you. Reply briefly in 1 sentence addressing their question. Do NOT sign off with your name.",
+		lk.Title, lk.Subtitle, lk.Description, lk.Source,
+	)
+}
+
+func (b *bot) marketplaceThread(threadKey int64) bool {
+	b.threadTypesMu.RLock()
+	tt, ok := b.threadTypes[threadKey]
+	b.threadTypesMu.RUnlock()
+	return ok && tt == table.MARKETPLACE
+}
+
 func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
+	threadID := msg.ThreadKey
+
+	if !b.marketplaceThread(threadID) {
+		return
+	}
+
+	l := b.extractListing(msg)
+	if l != nil {
+		b.log.Info().
+			Int64("tid", threadID).
+			Str("title", l.Title).
+			Str("subtitle", l.Subtitle).
+			Str("source", l.Source).
+			Msg("found listing share")
+		b.listingsMu.Lock()
+		b.listings[threadID] = l
+		b.listingsMu.Unlock()
+	}
+
 	if !b.selfTest && msg.SenderId == b.userID {
 		return
 	}
 
 	text := msg.Text
-	if text == "" {
-		b.log.Debug().Int64("tid", msg.ThreadKey).Int64("sid", msg.SenderId).Msg("empty text, skipped")
+	if text == "" && l == nil {
+		b.log.Debug().Int64("tid", threadID).Int64("sid", msg.SenderId).Msg("empty text, skipped")
 		return
 	}
 
 	b.log.Info().
 		Int64("sid", msg.SenderId).
-		Int64("tid", msg.ThreadKey).
+		Int64("tid", threadID).
 		Str("text", text).
 		Msg("new message")
 
-	threadID := msg.ThreadKey
+	if b.deepseekKey != "" {
+		reply, err := b.callDeepseek(b.buildPrompt(threadID), text)
+		if err != nil {
+			b.log.Err(err).Msg("deepseek call failed, falling back to rules")
+		} else if reply != "" {
+			b.log.Info().Str("reply", reply).Msg("deepseek reply")
+			b.sendReply(ctx, threadID, reply)
+			return
+		}
+	}
 
 	for i, rule := range b.rules {
 		if rule.compiled.MatchString(text) {
@@ -283,6 +404,70 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 		}
 	}
 	b.log.Debug().Int64("tid", threadID).Str("text", text).Msg("no rule matched")
+}
+
+type deepseekMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type deepseekRequest struct {
+	Model    string            `json:"model"`
+	Messages []deepseekMessage `json:"messages"`
+}
+
+type deepseekChoice struct {
+	Message deepseekMessage `json:"message"`
+}
+
+type deepseekResponse struct {
+	Choices []deepseekChoice `json:"choices"`
+}
+
+func (b *bot) callDeepseek(systemPrompt, userMessage string) (string, error) {
+	reqBody := deepseekRequest{
+		Model: "deepseek-chat",
+		Messages: []deepseekMessage{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userMessage},
+		},
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequest("POST", "https://api.deepseek.com/v1/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+b.deepseekKey)
+
+	resp, err := b.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("deepseek api error %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var ds deepseekResponse
+	if err := json.Unmarshal(respBody, &ds); err != nil {
+		return "", err
+	}
+	if len(ds.Choices) == 0 {
+		return "", fmt.Errorf("no choices in response")
+	}
+
+	return strings.TrimSpace(ds.Choices[0].Message.Content), nil
 }
 
 func (b *bot) sendReply(ctx context.Context, threadID int64, text string) {
@@ -331,6 +516,10 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 	sid, _ := strconv.ParseInt(fbMsg.Info.Sender.User, 10, 64)
 	tid, _ := strconv.ParseInt(fbMsg.Info.Chat.User, 10, 64)
 
+	if !b.marketplaceThread(tid) {
+		return
+	}
+
 	content := consumerApp.GetPayload().GetContent()
 	if content == nil {
 		return
@@ -361,6 +550,17 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 
 	if sid == b.userID {
 		return
+	}
+
+	if b.deepseekKey != "" {
+		reply, err := b.callDeepseek(b.buildPrompt(tid), text)
+		if err != nil {
+			b.log.Err(err).Msg("deepseek call failed (e2ee), falling back to rules")
+		} else if reply != "" {
+			b.log.Info().Str("reply", reply).Msg("deepseek reply (e2ee)")
+			b.sendE2EEReply(fbMsg.Info.Chat, reply)
+			return
+		}
 	}
 
 	for i, rule := range b.rules {
