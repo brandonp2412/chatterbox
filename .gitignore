@@ -1,0 +1,4 @@
+chatterbox
+*.log
+config.yaml
+vendor/

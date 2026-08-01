@@ -1,0 +1,125 @@
+# chatterbox
+
+Auto-reply bot for Facebook Marketplace messages. Talks directly to Facebook
+Messenger (no Matrix homeserver or bridge needed). Built on the
+[messagix](https://github.com/mautrix/meta/tree/main/pkg/messagix) library from
+[mautrix/meta](https://github.com/mautrix/meta).
+
+## How it works
+
+chatterbox logs in to Facebook Messenger with your browser cookies, connects to
+Facebook's internal WebSocket (the Lightspeed/DGW protocol), listens for
+incoming messages, and auto-replies based on configurable regex rules.
+
+```
+Facebook Messenger  <--WebSocket-->  chatterbox
+```
+
+No Matrix, no bridge, no homeserver — just Go and your Facebook session.
+
+## Setup
+
+### Prerequisites
+
+- Go 1.23+
+- Facebook account with access to Marketplace messages
+
+### 1. Get your Facebook cookies
+
+Open facebook.com or messenger.com in a browser where you're logged in.
+Open DevTools → Application → Cookies, and copy the values for:
+
+- `c_user` — your Facebook user ID
+- `xs` — your session token
+- `datr` — browser identifier
+
+### 2. Configure
+
+```bash
+cp config.example.yaml config.yaml
+```
+
+Edit `config.yaml` with your cookies and custom reply rules.
+
+### 3. Build and run
+
+```bash
+go build -o chatterbox
+./chatterbox
+```
+
+Or run directly:
+
+```bash
+go run .
+```
+
+If your config file is elsewhere:
+
+```bash
+./chatterbox /path/to/config.yaml
+```
+
+## Configuration
+
+### Mode
+
+```yaml
+mode: "facebook"      # facebook.com cookies
+# mode: "messenger"   # messenger.com cookies
+# mode: "messenger-lite"  # Messenger Lite API (mobile-style)
+```
+
+### Rules
+
+Each rule has a `pattern` (Go regex) and a `reply` string.
+
+```yaml
+rules:
+  - pattern: "(?i)is this (still )?available"
+    reply: "Yes, it's available!"
+
+  - pattern: "(?i)lowest.*price|best.*offer"
+    reply: "Price is firm."
+
+  - pattern: "(?i)ship|delivery|post"
+    reply: "Pickup only, sorry."
+
+  - pattern: "(?i)when can (?:i|we) meet"
+    reply: "I'm free evenings and weekends."
+
+  - pattern: "(?i)address|where|location"
+    reply: "Near the mall. I'll send the exact address once we confirm."
+```
+
+Rules are checked in order. The first match sends a reply (and subsequent
+rules are skipped for that message).
+
+### reply_once
+
+When `true` (default), each rule fires at most once per chat thread. Set to
+`false` to reply every time the pattern matches.
+
+```yaml
+reply_once: false
+```
+
+## Under the hood
+
+mauitrix/meta's `messagix` package implements Facebook Messenger's internal
+protocol stack:
+
+- **Authentication**: Browser cookies (`c_user`, `xs`, `datr`) sent as HTTP
+  headers — no API keys.
+- **WebSocket**: Facebook's DGW (Data Gateway) at
+  `wss://gateway.facebook.com/ws/lightspeed` with multiplexed streams.
+- **Application protocol**: Lightspeed — JSON task payloads over the
+  WebSocket. Sending a message is a task with label `46` (SendMessageTask).
+- **Message receipt**: Database sync over the socket via cursor-based
+  streams. Responses contain `LSTable` objects with operations like
+  `LSInsertNewMessageRange`.
+- **E2EE chats**: Uses WhatsApp's Signal-based encryption via the
+  `go.mau.fi/whatsmeow` library.
+
+All of this is handled transparently by the messagix library. chatterbox
+just hooks into the event stream and sends replies.
