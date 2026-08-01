@@ -439,10 +439,16 @@ func (b *bot) handleEvent(ctx context.Context, evt any) {
 
 	for _, msg := range insert {
 		b.processMessage(ctx, msg)
+		if count > 1 {
+			time.Sleep(500 * time.Millisecond)
+		}
 	}
 	for _, group := range upsert {
 		for _, msg := range group.Messages {
 			b.processMessage(ctx, msg)
+			if count > 1 {
+				time.Sleep(500 * time.Millisecond)
+			}
 		}
 	}
 }
@@ -703,15 +709,40 @@ func (b *bot) callDeepseek(systemPrompt, userMessage string) (string, error) {
 	return strings.TrimSpace(ds.Choices[0].Message.Content), nil
 }
 
+const markReadMaxAttempts = 3
+
 func (b *bot) markThreadRead(ctx context.Context, threadID int64) {
-	task := &socket.ThreadMarkReadTask{
-		ThreadId:            threadID,
-		LastReadWatermarkTs: time.Now().UnixMilli(),
-		SyncGroup:           1,
+	for attempt := 1; attempt <= markReadMaxAttempts; attempt++ {
+		task := &socket.ThreadMarkReadTask{
+			ThreadId:            threadID,
+			LastReadWatermarkTs: time.Now().UnixMilli(),
+			SyncGroup:           1,
+		}
+		resp, err := b.client.ExecuteTasks(ctx, task)
+		if err != nil {
+			b.log.Err(err).Int64("tid", threadID).Int("attempt", attempt).Msg("failed to mark thread read")
+		} else if threadReadConfirmed(resp, threadID) {
+			return
+		} else {
+			b.log.Warn().Int64("tid", threadID).Int("attempt", attempt).Msg("mark thread read not confirmed by server, retrying")
+		}
+		if attempt < markReadMaxAttempts {
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
 	}
-	if _, err := b.client.ExecuteTasks(ctx, task); err != nil {
-		b.log.Err(err).Int64("tid", threadID).Msg("failed to mark thread read")
+	b.log.Error().Int64("tid", threadID).Msg("giving up marking thread read after retries")
+}
+
+func threadReadConfirmed(resp *table.LSTable, threadID int64) bool {
+	if resp == nil {
+		return false
 	}
+	for _, r := range resp.LSMarkThreadReadV2 {
+		if r.GetThreadKey() == threadID {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *bot) sendReply(ctx context.Context, threadID int64, text string) {
@@ -861,7 +892,7 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 			b.repliedMu.Lock()
 			b.lastReplyAt[tid] = time.Now()
 			b.repliedMu.Unlock()
-			b.sendE2EEReply(fbMsg.Info.Chat, tid, reply)
+			b.sendE2EEReply(fbMsg.Info, tid, reply)
 			return
 		}
 	}
@@ -888,14 +919,14 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 			b.repliedMu.Lock()
 			b.lastReplyAt[tid] = time.Now()
 			b.repliedMu.Unlock()
-			b.sendE2EEReply(fbMsg.Info.Chat, tid, rule.Reply)
+			b.sendE2EEReply(fbMsg.Info, tid, rule.Reply)
 			return
 		}
 	}
 	b.log.Info().Int64("tid", tid).Str("text", text).Msg("e2ee no rule matched")
 }
 
-func (b *bot) sendE2EEReply(chatJID waTypes.JID, threadID int64, text string) {
+func (b *bot) sendE2EEReply(srcInfo waTypes.MessageInfo, threadID int64, text string) {
 	if b.waClient == nil {
 		b.log.Warn().Msg("no e2ee client, cannot reply")
 		return
@@ -913,12 +944,14 @@ func (b *bot) sendE2EEReply(chatJID waTypes.JID, threadID int64, text string) {
 			},
 		},
 	}
-	if _, err := b.waClient.SendFBMessage(context.Background(), chatJID, msg, nil); err != nil {
+	if _, err := b.waClient.SendFBMessage(context.Background(), srcInfo.Chat, msg, nil); err != nil {
 		b.log.Err(err).Msg("Failed to send e2ee reply")
 		return
 	}
 	b.log.Info().Msg("e2ee reply sent")
-	b.markThreadRead(context.Background(), threadID)
+	if err := b.waClient.MarkRead(context.Background(), []waTypes.MessageID{srcInfo.ID}, time.Now(), srcInfo.Chat, srcInfo.Sender); err != nil {
+		b.log.Err(err).Int64("tid", threadID).Msg("failed to mark e2ee thread read")
+	}
 }
 
 func loadConfig(path string) (*config, error) {
