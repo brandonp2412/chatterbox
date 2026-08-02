@@ -1,0 +1,22 @@
+mode: "facebook"
+
+cookies:
+  xs: ""
+  c_user: ""
+  datr: ""
+
+rules:
+  - pattern: "(?i)(?:is this|still)\\s+available"
+    reply: "Yes, are you interested?"
+  - pattern: "(?i)(?:price|how much|cost)"
+    reply: "The price is firm as listed in the ad."
+  - pattern: "(?i)(?:condition|used|new)"
+    reply: "It's in good condition. Let me know if you'd like more photos."
+
+reply_once: true
+reply_cooldown_minutes: 5
+reconnect_interval_minutes: 15
+log_level: "info"
+
+# Leave blank to use rule-based replies only.
+deepseek_key: ""
