@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	zlog "github.com/rs/zerolog/log"
 	"gopkg.in/yaml.v3"
 	_ "modernc.org/sqlite"
 
@@ -43,14 +44,15 @@ type rule struct {
 }
 
 type config struct {
-	Cookies              map[string]string `yaml:"cookies"`
-	Rules                []rule            `yaml:"rules"`
-	ReplyOnce            bool              `yaml:"reply_once"`
-	ReplyCooldownMinutes int               `yaml:"reply_cooldown_minutes"`
-	Mode                 string            `yaml:"mode"`
-	Proxy                string            `yaml:"proxy"`
-	LogLevel             string            `yaml:"log_level"`
-	DeepseekKey          string            `yaml:"deepseek_key"`
+	Cookies                  map[string]string `yaml:"cookies"`
+	Rules                    []rule            `yaml:"rules"`
+	ReplyOnce                bool              `yaml:"reply_once"`
+	ReplyCooldownMinutes     int               `yaml:"reply_cooldown_minutes"`
+	Mode                     string            `yaml:"mode"`
+	Proxy                    string            `yaml:"proxy"`
+	LogLevel                 string            `yaml:"log_level"`
+	DeepseekKey              string            `yaml:"deepseek_key"`
+	ReconnectIntervalMinutes int               `yaml:"reconnect_interval_minutes"`
 }
 
 type logFilter struct {
@@ -159,6 +161,14 @@ func run() error {
 		lvl = zerolog.DebugLevel
 	}
 	log := zerolog.New(&logFilter{out: zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: "3:04PM"}}).Level(lvl).With().Timestamp().Logger()
+	// messagix/whatsmeow are noisy at info/debug (socket internals, keepalives, dependency
+	// parsing) and that noise isn't ours to fix - only surface their warnings/errors.
+	libLog := log.Level(zerolog.WarnLevel)
+	// Some messagix internals (e.g. lightspeed/decode.go) log through zerolog's package-level
+	// global logger instead of the client-supplied one, bypassing libLog entirely. Route that
+	// through the same filtered writer and cap it at error level - its warnings are routine
+	// dependency-parsing noise, not something we can act on.
+	zlog.Logger = zlog.Logger.Output(&logFilter{out: zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: "3:04PM"}}).Level(zerolog.ErrorLevel)
 
 	mode := types.PlatformFromString(cfg.Mode)
 	if mode == types.Unset {
@@ -177,7 +187,7 @@ func run() error {
 		return fmt.Errorf("missing required cookies: %v", missing)
 	}
 
-	mc := messagix.NewClient(c, log, &messagix.Config{
+	mc := messagix.NewClient(c, libLog, &messagix.Config{
 		ClientSettings: exhttp.ClientSettings{},
 	})
 
@@ -237,6 +247,7 @@ func run() error {
 		lastReplyAt:   make(map[int64]time.Time),
 		replyCooldown: replyCooldown,
 		selfSentOtids: make(map[string]bool),
+		repliedMsgIDs: make(map[string]bool),
 		listings:      make(map[int64]*listing),
 		threadTypes:   make(map[int64]table.ThreadType),
 		contactNames:  make(map[int64]string),
@@ -259,6 +270,22 @@ func run() error {
 	go func() {
 		if err := waClient.Connect(); err != nil {
 			log.Err(err).Msg("Failed to connect e2ee socket")
+		}
+	}()
+
+	// The Messenger socket has no application-level heartbeat, so a connection can go
+	// silently stale (no error, no reconnect log, just no more events) and stay that way
+	// indefinitely. Periodically force a reconnect to bound how long that can last.
+	reconnectInterval := time.Duration(cfg.ReconnectIntervalMinutes) * time.Minute
+	if reconnectInterval <= 0 {
+		reconnectInterval = 15 * time.Minute
+	}
+	go func() {
+		ticker := time.NewTicker(reconnectInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			log.Debug().Msg("periodic proactive reconnect of messenger socket")
+			mc.ForceReconnect()
 		}
 	}()
 
@@ -310,6 +337,13 @@ type bot struct {
 	repliedMu     sync.Mutex
 	selfSentOtids map[string]bool
 	selfSentMu    sync.Mutex
+
+	// repliedMsgIDs guards against replying twice to the same inbound message (keyed by
+	// "threadID:messageID"). Cooldown alone isn't enough: a socket reconnect can redeliver
+	// an already-answered message as part of its backlog resync, well after the cooldown
+	// on that thread has expired.
+	repliedMsgIDs   map[string]bool
+	repliedMsgIDsMu sync.Mutex
 
 	listings      map[int64]*listing
 	listingsMu    sync.RWMutex
@@ -394,7 +428,6 @@ func (b *bot) handleEvent(ctx context.Context, evt any) {
 		return
 	}
 
-	b.log.Debug().Interface("table", tbl).Msg("dump of raw event table")
 	b.recordThreadTypes(tbl)
 
 	if len(tbl.LSVerifyContactRowExists) > 0 {
@@ -500,6 +533,22 @@ func (b *bot) buildPrompt(threadID int64) string {
 	)
 }
 
+// alreadyReplied reports whether key (a "threadID:messageID" pair) has already been replied to.
+func (b *bot) alreadyReplied(key string) bool {
+	b.repliedMsgIDsMu.Lock()
+	defer b.repliedMsgIDsMu.Unlock()
+	return b.repliedMsgIDs[key]
+}
+
+func (b *bot) markReplied(key string) {
+	if key == "" {
+		return
+	}
+	b.repliedMsgIDsMu.Lock()
+	b.repliedMsgIDs[key] = true
+	b.repliedMsgIDsMu.Unlock()
+}
+
 func (b *bot) marketplaceThread(threadKey int64) bool {
 	b.threadTypesMu.RLock()
 	tt, ok := b.threadTypes[threadKey]
@@ -534,12 +583,17 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 			Int64("type", int64(tt)).
 			Int("known_thread_count", mapSize).
 			Msg("skipping non-marketplace thread")
-		b.log.Debug().Interface("msg", msg).Msg("dump of skipped message")
 		return
 	}
 
 	if msg.TimestampMs < b.startTime.Add(-2*time.Minute).UnixMilli() {
 		b.log.Info().Int64("tid", threadID).Int64("ts", msg.TimestampMs).Msg("skipping old message")
+		return
+	}
+
+	msgKey := fmt.Sprintf("%d:%s", threadID, msg.MessageId)
+	if msg.MessageId != "" && b.alreadyReplied(msgKey) {
+		b.log.Info().Int64("tid", threadID).Str("message_id", msg.MessageId).Msg("skipping already-replied message")
 		return
 	}
 
@@ -607,6 +661,7 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 			b.repliedMu.Lock()
 			b.lastReplyAt[threadID] = time.Now()
 			b.repliedMu.Unlock()
+			b.markReplied(msgKey)
 			b.sendReply(ctx, threadID, reply)
 			return
 		}
@@ -634,6 +689,7 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 			b.repliedMu.Lock()
 			b.lastReplyAt[threadID] = time.Now()
 			b.repliedMu.Unlock()
+			b.markReplied(msgKey)
 			b.sendReply(ctx, threadID, rule.Reply)
 			return
 		}
@@ -827,6 +883,12 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 		return
 	}
 
+	msgKey := fmt.Sprintf("%d:%s", tid, fbMsg.Info.ID)
+	if fbMsg.Info.ID != "" && b.alreadyReplied(msgKey) {
+		b.log.Info().Int64("tid", tid).Str("message_id", fbMsg.Info.ID).Msg("e2ee: skipping already-replied message")
+		return
+	}
+
 	if fbMsg.Info.IsFromMe {
 		b.log.Info().Int64("tid", tid).Msg("e2ee: message from self, marking userThreads")
 		b.userThreadsMu.Lock()
@@ -892,6 +954,7 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 			b.repliedMu.Lock()
 			b.lastReplyAt[tid] = time.Now()
 			b.repliedMu.Unlock()
+			b.markReplied(msgKey)
 			b.sendE2EEReply(fbMsg.Info, tid, reply)
 			return
 		}
@@ -919,6 +982,7 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 			b.repliedMu.Lock()
 			b.lastReplyAt[tid] = time.Now()
 			b.repliedMu.Unlock()
+			b.markReplied(msgKey)
 			b.sendE2EEReply(fbMsg.Info, tid, rule.Reply)
 			return
 		}
