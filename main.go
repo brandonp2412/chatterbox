@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
@@ -1026,10 +1027,21 @@ func threadReadConfirmed(resp *table.LSTable, threadID int64) bool {
 	return false
 }
 
+// humanReplyDelay sleeps a randomized interval before sending, so replies read as a quick but
+// normal human response time rather than an instant bot reply.
+func humanReplyDelay(ctx context.Context) {
+	d := 3*time.Second + time.Duration(rand.Int63n(int64(5*time.Second)))
+	select {
+	case <-time.After(d):
+	case <-ctx.Done():
+	}
+}
+
 // sendReply returns whether the message actually sent. Callers must only record the reply
 // (cooldown, dedup, replied-once) when this returns true, so a failed send can be retried
 // instead of being permanently treated as handled.
 func (b *bot) sendReply(ctx context.Context, threadID int64, text string) bool {
+	humanReplyDelay(ctx)
 	otid := methods.GenerateEpochID()
 	task := &socket.SendMessageTask{
 		ThreadId:         threadID,
@@ -1278,6 +1290,7 @@ func (b *bot) sendE2EEReply(srcInfo waTypes.MessageInfo, threadID int64, text st
 		b.log.Warn().Msg("no e2ee client, cannot reply")
 		return false
 	}
+	humanReplyDelay(context.Background())
 	msg := &waConsumer.ConsumerApplication{
 		Payload: &waConsumer.ConsumerApplication_Payload{
 			Payload: &waConsumer.ConsumerApplication_Payload_Content{
