@@ -240,26 +240,27 @@ func run() error {
 	}
 
 	bot := &bot{
-		log:           log,
-		client:        mc,
-		waClient:      waClient,
-		rules:         cfg.Rules,
-		replyOnce:     cfg.ReplyOnce && !selfTest,
-		replied:       make(map[int64]map[int]bool),
-		userID:        userInfo.GetFBID(),
-		selfTest:      selfTest,
-		startTime:     time.Now(),
-		userThreads:   make(map[int64]bool),
-		lastReplyAt:   make(map[int64]time.Time),
-		replyCooldown: replyCooldown,
-		selfSentOtids: make(map[string]bool),
-		repliedMsgIDs: make(map[string]bool),
-		listings:      make(map[int64]*listing),
-		threadTypes:   make(map[int64]table.ThreadType),
-		contactNames:  make(map[int64]string),
-		devContacts:   devContactIDs,
-		deepseekKey:   deepseekKey,
-		httpClient:    &http.Client{Timeout: 30 * time.Second},
+		log:             log,
+		client:          mc,
+		waClient:        waClient,
+		rules:           cfg.Rules,
+		replyOnce:       cfg.ReplyOnce && !selfTest,
+		replied:         make(map[int64]map[int]bool),
+		userID:          userInfo.GetFBID(),
+		selfTest:        selfTest,
+		startTime:       time.Now(),
+		userThreads:     make(map[int64]bool),
+		lastReplyAt:     make(map[int64]time.Time),
+		replyCooldown:   replyCooldown,
+		selfSentOtids:   make(map[string]bool),
+		repliedMsgIDs:   make(map[string]bool),
+		listings:        make(map[int64]*listing),
+		threadTypes:     make(map[int64]table.ThreadType),
+		contactNames:    make(map[int64]string),
+		devContacts:     devContactIDs,
+		deepseekKey:     deepseekKey,
+		httpClient:      &http.Client{Timeout: 30 * time.Second},
+		awaitingContent: make(map[int64]time.Time),
 	}
 
 	bot.recordThreadTypes(initialTable)
@@ -278,6 +279,8 @@ func run() error {
 			log.Err(err).Msg("Failed to connect e2ee socket")
 		}
 	}()
+
+	go bot.contentRecoveryLoop(ctx)
 
 	// messagix already has its own ping/pong heartbeat (10s ping, 30s pong timeout) that
 	// recovers ordinary dead connections on its own, and the Event_PermanentError handler
@@ -363,6 +366,14 @@ type bot struct {
 	contactNames   map[int64]string
 	contactNamesMu sync.RWMutex
 	devContacts    map[int64]bool
+
+	// awaitingContent tracks threads just classified MARKETPLACE via the quick-reply CTA that
+	// haven't had a real (non-empty-text) message show up yet, keyed by when they were armed.
+	// Brand-new marketplace threads' first message doesn't reliably arrive live over either
+	// the mc or e2ee socket - see contentRecoveryLoop, which explicitly fetches these instead
+	// of waiting on a blind reconnect timer.
+	awaitingContent   map[int64]time.Time
+	awaitingContentMu sync.Mutex
 }
 
 func (b *bot) recordThreadTypes(tbl *table.LSTable) {
@@ -419,12 +430,75 @@ func (b *bot) recordThreadTypes(tbl *table.LSTable) {
 				Int64("tid", cta.ThreadKey).
 				Msg("marking thread as marketplace from quick-reply CTA")
 			b.threadTypes[cta.ThreadKey] = table.MARKETPLACE
+			b.armContentRecovery(cta.ThreadKey)
 		}
 	}
 	for _, t := range tbl.LSVerifyThreadExists {
 		set("LSVerifyThreadExists", t.ThreadKey, t.ThreadType)
 	}
 	b.threadTypesMu.Unlock()
+}
+
+func (b *bot) armContentRecovery(threadKey int64) {
+	b.awaitingContentMu.Lock()
+	if _, exists := b.awaitingContent[threadKey]; !exists {
+		b.awaitingContent[threadKey] = time.Now()
+	}
+	b.awaitingContentMu.Unlock()
+}
+
+func (b *bot) clearContentRecovery(threadKey int64) {
+	b.awaitingContentMu.Lock()
+	delete(b.awaitingContent, threadKey)
+	b.awaitingContentMu.Unlock()
+}
+
+const contentRecoveryGracePeriod = 20 * time.Second
+
+// contentRecoveryLoop watches for threads that were marked MARKETPLACE by the quick-reply CTA
+// but never got a real message delivered live over either the mc or e2ee socket - an observed
+// gap specifically for brand-new marketplace threads. Rather than reconnecting anything, it
+// pulls just that one thread directly once the grace period elapses.
+func (b *bot) contentRecoveryLoop(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		var due []int64
+		now := time.Now()
+		b.awaitingContentMu.Lock()
+		for tid, armedAt := range b.awaitingContent {
+			if now.Sub(armedAt) >= contentRecoveryGracePeriod {
+				due = append(due, tid)
+				delete(b.awaitingContent, tid)
+			}
+		}
+		b.awaitingContentMu.Unlock()
+		for _, tid := range due {
+			b.recoverMissingMessages(ctx, tid)
+		}
+	}
+}
+
+// recoverMissingMessages explicitly fetches a thread's recent messages over the existing mc
+// connection, using the same FetchMessagesTask the real mautrix-meta bridge uses for backfill -
+// scoped to just this one thread, no reconnect, no effect on e2ee or any other thread.
+func (b *bot) recoverMissingMessages(ctx context.Context, threadKey int64) {
+	b.log.Warn().Int64("tid", threadKey).Msg("no message content seen for new marketplace thread after grace period, fetching directly")
+	tbl, err := b.client.ExecuteTasks(ctx, &socket.FetchMessagesTask{
+		ThreadKey:            threadKey,
+		Direction:            0,
+		ReferenceTimestampMs: time.Now().UnixMilli(),
+		SyncGroup:            1,
+		Cursor:               b.client.GetCursor(1),
+	})
+	if err != nil {
+		b.log.Err(err).Int64("tid", threadKey).Msg("failed to fetch missing messages")
+		return
+	}
+	if tbl == nil {
+		return
+	}
+	b.processTable(ctx, tbl)
 }
 
 func (b *bot) handleEvent(ctx context.Context, evt any) {
@@ -453,6 +527,14 @@ func (b *bot) handleEvent(ctx context.Context, evt any) {
 		return
 	}
 
+	b.processTable(ctx, tbl)
+}
+
+// processTable applies an LSTable to bot state and dispatches any messages in it. It's shared
+// between live push events (handleEvent) and the targeted recovery fetch (recoverMissingMessages),
+// since ExecuteTasks returns its response table directly rather than routing it through the event
+// handler.
+func (b *bot) processTable(ctx context.Context, tbl *table.LSTable) {
 	b.recordThreadTypes(tbl)
 
 	if len(tbl.LSVerifyContactRowExists) > 0 {
@@ -670,6 +752,7 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 		b.log.Info().Int64("tid", threadID).Int64("sid", msg.SenderId).Bool("admin", msg.IsAdminMessage).Msg("skipping empty message")
 		return
 	}
+	b.clearContentRecovery(threadID)
 
 	b.log.Info().
 		Int64("sid", msg.SenderId).
@@ -991,6 +1074,7 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 		b.log.Info().Int64("tid", tid).Str("content_type", fmt.Sprintf("%T", content.GetContent())).Msg("e2ee: empty text, skipping")
 		return
 	}
+	b.clearContentRecovery(tid)
 
 	b.log.Info().
 		Int64("sid", sid).
