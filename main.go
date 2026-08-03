@@ -378,6 +378,10 @@ type bot struct {
 	awaitingContentMu sync.Mutex
 }
 
+// selfEchoGracePeriod bounds how long after we send a reply we'll treat any echo of our own
+// message landing in that thread as ours, even if its ID doesn't match what we sent.
+const selfEchoGracePeriod = 30 * time.Second
+
 type awaitingContentState struct {
 	armedAt  time.Time
 	attempts int
@@ -571,25 +575,36 @@ func (b *bot) processTable(ctx context.Context, tbl *table.LSTable) {
 	}
 
 	b.selfSentMu.Lock()
-	isSelfSent := func(otid string) bool {
-		if otid == "" {
-			return false
+	isSelfSent := func(ids ...string) bool {
+		for _, id := range ids {
+			if id != "" && b.selfSentOtids[id] {
+				return true
+			}
 		}
-		return b.selfSentOtids[otid]
+		return false
+	}
+	b.selfSentMu.Unlock()
+	// Belt-and-braces on top of the MessageId/OfflineThreadingId check above: if that ID
+	// tracking ever misses for some other reason, still don't mark a thread as user-participated
+	// from something landing right after we know we just replied there ourselves.
+	recentlySelfReplied := func(threadKey int64) bool {
+		b.repliedMu.Lock()
+		last, ok := b.lastReplyAt[threadKey]
+		b.repliedMu.Unlock()
+		return ok && time.Since(last) < selfEchoGracePeriod
 	}
 	b.userThreadsMu.Lock()
 	for _, msg := range tbl.LSUpsertMessage {
-		if msg.SenderId == b.userID && !isSelfSent(msg.OfflineThreadingId) {
+		if msg.SenderId == b.userID && !isSelfSent(msg.MessageId, msg.OfflineThreadingId) && !recentlySelfReplied(msg.ThreadKey) {
 			b.userThreads[msg.ThreadKey] = true
 		}
 	}
 	for _, msg := range tbl.LSInsertMessage {
-		if msg.SenderId == b.userID && !isSelfSent(msg.OfflineThreadingId) {
+		if msg.SenderId == b.userID && !isSelfSent(msg.MessageId, msg.OfflineThreadingId) && !recentlySelfReplied(msg.ThreadKey) {
 			b.userThreads[msg.ThreadKey] = true
 		}
 	}
 	b.userThreadsMu.Unlock()
-	b.selfSentMu.Unlock()
 
 	upsert, insert := tbl.WrapMessages()
 	count := len(insert)
@@ -963,13 +978,31 @@ func (b *bot) sendReply(ctx context.Context, threadID int64, text string) bool {
 		Text:             text,
 	}
 
+	otidStr := strconv.FormatInt(otid, 10)
 	b.selfSentMu.Lock()
-	b.selfSentOtids[strconv.FormatInt(otid, 10)] = true
+	b.selfSentOtids[otidStr] = true
 	b.selfSentMu.Unlock()
 
-	if _, err := b.client.ExecuteTasks(ctx, task); err != nil {
+	resp, err := b.client.ExecuteTasks(ctx, task)
+	if err != nil {
 		b.log.Err(err).Msg("Failed to send reply")
 		return false
+	}
+	// The real message ID assigned to this send only appears here, in
+	// LSReplaceOptimsiticMessage matched by our Otid (this is how the real mautrix-meta bridge
+	// tracks its own sent messages too - see pkg/connector/handlematrix.go). The OfflineThreadingId
+	// on a *later* echoed LSInsertMessage/LSUpsertMessage doesn't reliably match our Otid for a
+	// reply sent into a thread that's e2ee underneath, which was silently marking the thread as
+	// user-participated and permanently killing auto-replies there. Recording the real ID here
+	// gives the self-sent check something that actually matches on replay.
+	if resp != nil {
+		for _, replace := range resp.LSReplaceOptimsiticMessage {
+			if replace.OfflineThreadingId == otidStr && replace.MessageId != "" {
+				b.selfSentMu.Lock()
+				b.selfSentOtids[replace.MessageId] = true
+				b.selfSentMu.Unlock()
+			}
+		}
 	}
 	b.log.Info().Msg("reply sent")
 	b.markThreadRead(ctx, threadID)
