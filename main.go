@@ -239,6 +239,12 @@ func run() error {
 		replyCooldown = 5 * time.Minute
 	}
 
+	selfSentOtids, err := loadSelfSentIDs(selfSentIDsFile)
+	if err != nil {
+		return fmt.Errorf("failed to load self-sent message ids: %w", err)
+	}
+	log.Info().Int("count", len(selfSentOtids)).Msg("loaded self-sent message ids")
+
 	bot := &bot{
 		log:             log,
 		client:          mc,
@@ -252,7 +258,7 @@ func run() error {
 		userThreads:     make(map[int64]bool),
 		lastReplyAt:     make(map[int64]time.Time),
 		replyCooldown:   replyCooldown,
-		selfSentOtids:   make(map[string]bool),
+		selfSentOtids:   selfSentOtids,
 		repliedMsgIDs:   make(map[string]bool),
 		listings:        make(map[int64]*listing),
 		threadTypes:     make(map[int64]table.ThreadType),
@@ -593,14 +599,23 @@ func (b *bot) processTable(ctx context.Context, tbl *table.LSTable) {
 		b.repliedMu.Unlock()
 		return ok && time.Since(last) < selfEchoGracePeriod
 	}
+	// Every resync (a restart's initial backlog fetch, or any later forced reconnect) replays
+	// old history, including our own past auto-replies. There's no reason for that replay to
+	// affect current state - only genuinely new activity should be able to mark a thread
+	// user-participated. This also covers self-sent IDs from before recordSelfSent started
+	// persisting them to disk (a restart with an empty/pre-persistence ID file used to
+	// re-mark old threads as user-participated purely from replaying their own history).
+	isRecent := func(timestampMs int64) bool {
+		return timestampMs >= b.startTime.Add(-2*time.Minute).UnixMilli()
+	}
 	b.userThreadsMu.Lock()
 	for _, msg := range tbl.LSUpsertMessage {
-		if msg.SenderId == b.userID && !isSelfSent(msg.MessageId, msg.OfflineThreadingId) && !recentlySelfReplied(msg.ThreadKey) {
+		if msg.SenderId == b.userID && isRecent(msg.TimestampMs) && !isSelfSent(msg.MessageId, msg.OfflineThreadingId) && !recentlySelfReplied(msg.ThreadKey) {
 			b.userThreads[msg.ThreadKey] = true
 		}
 	}
 	for _, msg := range tbl.LSInsertMessage {
-		if msg.SenderId == b.userID && !isSelfSent(msg.MessageId, msg.OfflineThreadingId) && !recentlySelfReplied(msg.ThreadKey) {
+		if msg.SenderId == b.userID && isRecent(msg.TimestampMs) && !isSelfSent(msg.MessageId, msg.OfflineThreadingId) && !recentlySelfReplied(msg.ThreadKey) {
 			b.userThreads[msg.ThreadKey] = true
 		}
 	}
@@ -784,7 +799,8 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 
 	if !b.selfTest && msg.SenderId == b.userID {
 		b.selfSentMu.Lock()
-		selfSent := msg.OfflineThreadingId != "" && b.selfSentOtids[msg.OfflineThreadingId]
+		selfSent := (msg.MessageId != "" && b.selfSentOtids[msg.MessageId]) ||
+			(msg.OfflineThreadingId != "" && b.selfSentOtids[msg.OfflineThreadingId])
 		b.selfSentMu.Unlock()
 		if !selfSent {
 			b.userThreadsMu.Lock()
@@ -927,6 +943,53 @@ func (b *bot) callDeepseek(systemPrompt, userMessage string) (string, error) {
 	return strings.TrimSpace(ds.Choices[0].Message.Content), nil
 }
 
+const selfSentIDsFile = "self_sent_ids.txt"
+
+// recordSelfSent marks id as one of our own sent messages, both in memory and durably on disk.
+// Persistence matters because a restart's initial backlog resync replays our own historical
+// replies - without a durable record, those replays fail the self-sent check (selfSentOtids
+// would be empty again) and get mistaken for Brandon manually replying, which permanently
+// silences the bot on that thread. Confirmed live: this happened to two different threads
+// immediately after a restart before this was added.
+func (b *bot) recordSelfSent(id string) {
+	if id == "" {
+		return
+	}
+	b.selfSentMu.Lock()
+	defer b.selfSentMu.Unlock()
+	if b.selfSentOtids[id] {
+		return
+	}
+	b.selfSentOtids[id] = true
+	f, err := os.OpenFile(selfSentIDsFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		b.log.Err(err).Msg("failed to persist self-sent message id")
+		return
+	}
+	defer f.Close()
+	if _, err := f.WriteString(id + "\n"); err != nil {
+		b.log.Err(err).Msg("failed to persist self-sent message id")
+	}
+}
+
+func loadSelfSentIDs(path string) (map[string]bool, error) {
+	ids := make(map[string]bool)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return ids, nil
+		}
+		return nil, err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			ids[line] = true
+		}
+	}
+	return ids, nil
+}
+
 const markReadMaxAttempts = 3
 
 func (b *bot) markThreadRead(ctx context.Context, threadID int64) {
@@ -979,9 +1042,7 @@ func (b *bot) sendReply(ctx context.Context, threadID int64, text string) bool {
 	}
 
 	otidStr := strconv.FormatInt(otid, 10)
-	b.selfSentMu.Lock()
-	b.selfSentOtids[otidStr] = true
-	b.selfSentMu.Unlock()
+	b.recordSelfSent(otidStr)
 
 	resp, err := b.client.ExecuteTasks(ctx, task)
 	if err != nil {
@@ -998,9 +1059,7 @@ func (b *bot) sendReply(ctx context.Context, threadID int64, text string) bool {
 	if resp != nil {
 		for _, replace := range resp.LSReplaceOptimsiticMessage {
 			if replace.OfflineThreadingId == otidStr && replace.MessageId != "" {
-				b.selfSentMu.Lock()
-				b.selfSentOtids[replace.MessageId] = true
-				b.selfSentMu.Unlock()
+				b.recordSelfSent(replace.MessageId)
 			}
 		}
 	}
@@ -1238,9 +1297,7 @@ func (b *bot) sendE2EEReply(srcInfo waTypes.MessageInfo, threadID int64, text st
 		return false
 	}
 	if resp.ID != "" {
-		b.selfSentMu.Lock()
-		b.selfSentOtids[resp.ID] = true
-		b.selfSentMu.Unlock()
+		b.recordSelfSent(resp.ID)
 	}
 	b.log.Info().Msg("e2ee reply sent")
 	if err := b.waClient.MarkRead(context.Background(), []waTypes.MessageID{srcInfo.ID}, time.Now(), srcInfo.Chat, srcInfo.Sender); err != nil {
