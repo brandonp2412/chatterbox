@@ -273,9 +273,11 @@ func run() error {
 		}
 	}()
 
-	// The Messenger socket has no application-level heartbeat, so a connection can go
-	// silently stale (no error, no reconnect log, just no more events) and stay that way
-	// indefinitely. Periodically force a reconnect to bound how long that can last.
+	// messagix already has its own ping/pong heartbeat (10s ping, 30s pong timeout) that
+	// recovers ordinary dead connections on its own, and the Event_PermanentError handler
+	// above now restarts the connection when the library's own reconnect loop gives up for
+	// good. This ticker is just a last-resort safety net in case some failure mode slips
+	// past both of those.
 	reconnectInterval := time.Duration(cfg.ReconnectIntervalMinutes) * time.Minute
 	if reconnectInterval <= 0 {
 		reconnectInterval = 15 * time.Minute
@@ -424,6 +426,23 @@ func (b *bot) handleEvent(ctx context.Context, evt any) {
 	switch e := evt.(type) {
 	case *messagix.Event_PublishResponse:
 		tbl = e.Table
+	case *messagix.Event_PermanentError:
+		// messagix's own reconnect loop (in Client.Connect) gives up for good after this -
+		// it will never retry again on its own. We're the only thing that can bring the
+		// messenger socket back.
+		b.log.Error().Err(e.Err).Msg("messenger socket permanently failed, restarting connection")
+		go func() {
+			if err := b.client.Connect(ctx); err != nil {
+				b.log.Err(err).Msg("failed to restart messenger connection")
+			}
+		}()
+		return
+	case *messagix.Event_SocketError:
+		b.log.Warn().Err(e.Err).Int("attempt", e.ConnectionAttempts).Msg("messenger socket error, library is retrying")
+		return
+	case *messagix.Event_Reconnected:
+		b.log.Info().Msg("messenger socket reconnected")
+		return
 	default:
 		return
 	}
@@ -832,8 +851,29 @@ func (b *bot) e2eeHandler(evt any) {
 		b.handleE2EEMessage(evt)
 	case *waEvents.Connected:
 		b.log.Info().Msg("e2ee socket connected")
+		// Marks us as an active/foreground client. Without this, delivery receipts go out as
+		// "inactive" (the same signal WhatsApp Web sends when backgrounded), which is exactly
+		// the kind of state Meta can use to quietly stop pushing new messages down an
+		// otherwise-healthy, keepalive-passing socket.
+		if err := b.waClient.SendPresence(context.Background(), waTypes.PresenceAvailable); err != nil {
+			b.log.Err(err).Msg("failed to send e2ee presence")
+		}
 	case *waEvents.LoggedOut:
-		b.log.Warn().Msg("e2ee logged out")
+		b.log.Warn().Bool("on_connect", evt.OnConnect).Int("reason", int(evt.Reason)).Msg("e2ee logged out")
+	case *waEvents.Disconnected:
+		b.log.Warn().Msg("e2ee socket disconnected, whatsmeow is auto-reconnecting")
+	case *waEvents.StreamReplaced:
+		b.log.Warn().Msg("e2ee stream replaced - session opened elsewhere, this connection is dead")
+	case *waEvents.KeepAliveTimeout:
+		b.log.Warn().Int("error_count", evt.ErrorCount).Time("last_success", evt.LastSuccess).Msg("e2ee keepalive timeout")
+	case *waEvents.KeepAliveRestored:
+		b.log.Info().Msg("e2ee keepalive restored")
+	case *waEvents.ConnectFailure:
+		b.log.Error().Int("reason", int(evt.Reason)).Str("message", evt.Message).Msg("e2ee connect failure")
+	case *waEvents.CATRefreshError:
+		b.log.Err(evt.Error).Msg("e2ee crypto auth token refresh failed")
+	case *waEvents.TemporaryBan:
+		b.log.Error().Int("code", int(evt.Code)).Dur("expire", evt.Expire).Msg("e2ee temporary ban")
 	}
 }
 
