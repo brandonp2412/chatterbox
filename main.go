@@ -479,26 +479,20 @@ func (b *bot) contentRecoveryLoop(ctx context.Context) {
 	}
 }
 
-// recoverMissingMessages explicitly fetches a thread's recent messages over the existing mc
-// connection, using the same FetchMessagesTask the real mautrix-meta bridge uses for backfill -
-// scoped to just this one thread, no reconnect, no effect on e2ee or any other thread.
+// recoverMissingMessages forces the mc connection to reconnect, which triggers a full backlog
+// resync - the only mechanism that's actually been observed to surface a brand-new marketplace
+// thread's first message when it doesn't arrive live over either the mc or e2ee socket.
+//
+// FetchMessagesTask (the real mautrix-meta bridge's backfill call) was tried first here, but it's
+// pure backward pagination: it requires a MinTimestampMs/MinMessageId anchor from a
+// LSUpsertSyncGroupThreadsRange the thread already has. A genuinely brand-new thread has no such
+// anchor yet, so the request comes back with nothing to give - confirmed live, not a guess.
+//
+// This is still evidence-driven rather than a blind timer: it only fires when a specific thread
+// has been stuck with no content past the grace period, not on every tick regardless of need.
 func (b *bot) recoverMissingMessages(ctx context.Context, threadKey int64) {
-	b.log.Warn().Int64("tid", threadKey).Msg("no message content seen for new marketplace thread after grace period, fetching directly")
-	tbl, err := b.client.ExecuteTasks(ctx, &socket.FetchMessagesTask{
-		ThreadKey:            threadKey,
-		Direction:            0,
-		ReferenceTimestampMs: time.Now().UnixMilli(),
-		SyncGroup:            1,
-		Cursor:               b.client.GetCursor(1),
-	})
-	if err != nil {
-		b.log.Err(err).Int64("tid", threadKey).Msg("failed to fetch missing messages")
-		return
-	}
-	if tbl == nil {
-		return
-	}
-	b.processTable(ctx, tbl)
+	b.log.Warn().Int64("tid", threadKey).Msg("no message content seen for new marketplace thread after grace period, forcing a resync")
+	b.client.ForceReconnect()
 }
 
 func (b *bot) handleEvent(ctx context.Context, evt any) {
