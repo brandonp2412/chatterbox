@@ -760,11 +760,12 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 			b.log.Err(err).Msg("deepseek call failed, falling back to rules")
 		} else if reply != "" {
 			b.log.Info().Str("reply", reply).Msg("deepseek reply")
-			b.repliedMu.Lock()
-			b.lastReplyAt[threadID] = time.Now()
-			b.repliedMu.Unlock()
-			b.markReplied(msgKey)
-			b.sendReply(ctx, threadID, reply)
+			if b.sendReply(ctx, threadID, reply) {
+				b.repliedMu.Lock()
+				b.lastReplyAt[threadID] = time.Now()
+				b.repliedMu.Unlock()
+				b.markReplied(msgKey)
+			}
 			return
 		}
 	}
@@ -780,7 +781,6 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 				if rset[i] {
 					continue
 				}
-				rset[i] = true
 			}
 
 			b.log.Debug().
@@ -788,11 +788,18 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 				Str("pattern", rule.Pattern).
 				Msg("auto-replying")
 
-			b.repliedMu.Lock()
-			b.lastReplyAt[threadID] = time.Now()
-			b.repliedMu.Unlock()
-			b.markReplied(msgKey)
-			b.sendReply(ctx, threadID, rule.Reply)
+			// Only record the reply (cooldown, replied-once, message-dedup) once it's actually
+			// sent - marking it beforehand meant a failed send (e.g. a reconnect racing the
+			// send) would permanently mark the message as handled despite never answering it.
+			if b.sendReply(ctx, threadID, rule.Reply) {
+				if b.replyOnce {
+					b.replied[threadID][i] = true
+				}
+				b.repliedMu.Lock()
+				b.lastReplyAt[threadID] = time.Now()
+				b.repliedMu.Unlock()
+				b.markReplied(msgKey)
+			}
 			return
 		}
 	}
@@ -903,7 +910,10 @@ func threadReadConfirmed(resp *table.LSTable, threadID int64) bool {
 	return false
 }
 
-func (b *bot) sendReply(ctx context.Context, threadID int64, text string) {
+// sendReply returns whether the message actually sent. Callers must only record the reply
+// (cooldown, dedup, replied-once) when this returns true, so a failed send can be retried
+// instead of being permanently treated as handled.
+func (b *bot) sendReply(ctx context.Context, threadID int64, text string) bool {
 	otid := methods.GenerateEpochID()
 	task := &socket.SendMessageTask{
 		ThreadId:         threadID,
@@ -921,10 +931,11 @@ func (b *bot) sendReply(ctx context.Context, threadID int64, text string) {
 
 	if _, err := b.client.ExecuteTasks(ctx, task); err != nil {
 		b.log.Err(err).Msg("Failed to send reply")
-		return
+		return false
 	}
 	b.log.Info().Msg("reply sent")
 	b.markThreadRead(ctx, threadID)
+	return true
 }
 
 func (b *bot) e2eeHandler(evt any) {
@@ -1086,11 +1097,12 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 			b.log.Err(err).Msg("deepseek call failed (e2ee), falling back to rules")
 		} else if reply != "" {
 			b.log.Info().Str("reply", reply).Msg("deepseek reply (e2ee)")
-			b.repliedMu.Lock()
-			b.lastReplyAt[tid] = time.Now()
-			b.repliedMu.Unlock()
-			b.markReplied(msgKey)
-			b.sendE2EEReply(fbMsg.Info, tid, reply)
+			if b.sendE2EEReply(fbMsg.Info, tid, reply) {
+				b.repliedMu.Lock()
+				b.lastReplyAt[tid] = time.Now()
+				b.repliedMu.Unlock()
+				b.markReplied(msgKey)
+			}
 			return
 		}
 	}
@@ -1106,7 +1118,6 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 				if rset[i] {
 					continue
 				}
-				rset[i] = true
 			}
 
 			b.log.Debug().
@@ -1114,21 +1125,28 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 				Str("pattern", rule.Pattern).
 				Msg("auto-replying (e2ee)")
 
-			b.repliedMu.Lock()
-			b.lastReplyAt[tid] = time.Now()
-			b.repliedMu.Unlock()
-			b.markReplied(msgKey)
-			b.sendE2EEReply(fbMsg.Info, tid, rule.Reply)
+			if b.sendE2EEReply(fbMsg.Info, tid, rule.Reply) {
+				if b.replyOnce {
+					b.replied[tid][i] = true
+				}
+				b.repliedMu.Lock()
+				b.lastReplyAt[tid] = time.Now()
+				b.repliedMu.Unlock()
+				b.markReplied(msgKey)
+			}
 			return
 		}
 	}
 	b.log.Info().Int64("tid", tid).Str("text", text).Msg("e2ee no rule matched")
 }
 
-func (b *bot) sendE2EEReply(srcInfo waTypes.MessageInfo, threadID int64, text string) {
+// sendE2EEReply returns whether the message actually sent. Callers must only record the reply
+// (cooldown, dedup, replied-once) when this returns true, so a failed send can be retried
+// instead of being permanently treated as handled.
+func (b *bot) sendE2EEReply(srcInfo waTypes.MessageInfo, threadID int64, text string) bool {
 	if b.waClient == nil {
 		b.log.Warn().Msg("no e2ee client, cannot reply")
-		return
+		return false
 	}
 	msg := &waConsumer.ConsumerApplication{
 		Payload: &waConsumer.ConsumerApplication_Payload{
@@ -1146,7 +1164,7 @@ func (b *bot) sendE2EEReply(srcInfo waTypes.MessageInfo, threadID int64, text st
 	resp, err := b.waClient.SendFBMessage(context.Background(), srcInfo.Chat, msg, nil)
 	if err != nil {
 		b.log.Err(err).Msg("Failed to send e2ee reply")
-		return
+		return false
 	}
 	if resp.ID != "" {
 		b.selfSentMu.Lock()
@@ -1157,6 +1175,7 @@ func (b *bot) sendE2EEReply(srcInfo waTypes.MessageInfo, threadID int64, text st
 	if err := b.waClient.MarkRead(context.Background(), []waTypes.MessageID{srcInfo.ID}, time.Now(), srcInfo.Chat, srcInfo.Sender); err != nil {
 		b.log.Err(err).Int64("tid", threadID).Msg("failed to mark e2ee thread read")
 	}
+	return true
 }
 
 func loadConfig(path string) (*config, error) {
