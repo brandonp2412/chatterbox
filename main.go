@@ -260,7 +260,7 @@ func run() error {
 		devContacts:     devContactIDs,
 		deepseekKey:     deepseekKey,
 		httpClient:      &http.Client{Timeout: 30 * time.Second},
-		awaitingContent: make(map[int64]time.Time),
+		awaitingContent: make(map[int64]*awaitingContentState),
 	}
 
 	bot.recordThreadTypes(initialTable)
@@ -368,12 +368,19 @@ type bot struct {
 	devContacts    map[int64]bool
 
 	// awaitingContent tracks threads just classified MARKETPLACE via the quick-reply CTA that
-	// haven't had a real (non-empty-text) message show up yet, keyed by when they were armed.
-	// Brand-new marketplace threads' first message doesn't reliably arrive live over either
-	// the mc or e2ee socket - see contentRecoveryLoop, which explicitly fetches these instead
-	// of waiting on a blind reconnect timer.
-	awaitingContent   map[int64]time.Time
+	// haven't had a real (non-empty-text) message show up yet. Brand-new marketplace threads'
+	// first message doesn't reliably arrive live over either the mc or e2ee socket - see
+	// contentRecoveryLoop, which explicitly fetches these instead of waiting on a blind
+	// reconnect timer. A single recovery attempt isn't always enough (observed live: the
+	// resync it triggers doesn't always happen to include the thread being recovered), so this
+	// tracks armedAt/attempts to retry a bounded number of times.
+	awaitingContent   map[int64]*awaitingContentState
 	awaitingContentMu sync.Mutex
+}
+
+type awaitingContentState struct {
+	armedAt  time.Time
+	attempts int
 }
 
 func (b *bot) recordThreadTypes(tbl *table.LSTable) {
@@ -442,7 +449,7 @@ func (b *bot) recordThreadTypes(tbl *table.LSTable) {
 func (b *bot) armContentRecovery(threadKey int64) {
 	b.awaitingContentMu.Lock()
 	if _, exists := b.awaitingContent[threadKey]; !exists {
-		b.awaitingContent[threadKey] = time.Now()
+		b.awaitingContent[threadKey] = &awaitingContentState{armedAt: time.Now()}
 	}
 	b.awaitingContentMu.Unlock()
 }
@@ -453,12 +460,17 @@ func (b *bot) clearContentRecovery(threadKey int64) {
 	b.awaitingContentMu.Unlock()
 }
 
-const contentRecoveryGracePeriod = 20 * time.Second
+const (
+	contentRecoveryGracePeriod = 20 * time.Second
+	contentRecoveryMaxAttempts = 3
+)
 
 // contentRecoveryLoop watches for threads that were marked MARKETPLACE by the quick-reply CTA
 // but never got a real message delivered live over either the mc or e2ee socket - an observed
-// gap specifically for brand-new marketplace threads. Rather than reconnecting anything, it
-// pulls just that one thread directly once the grace period elapses.
+// gap specifically for brand-new marketplace threads. Rather than reconnecting blindly on a
+// timer, it forces a resync once the grace period elapses. A single attempt isn't always
+// enough (the resync it triggers doesn't always happen to land on the thread being recovered),
+// so it retries up to contentRecoveryMaxAttempts times before giving up.
 func (b *bot) contentRecoveryLoop(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -466,15 +478,32 @@ func (b *bot) contentRecoveryLoop(ctx context.Context) {
 		var due []int64
 		now := time.Now()
 		b.awaitingContentMu.Lock()
-		for tid, armedAt := range b.awaitingContent {
-			if now.Sub(armedAt) >= contentRecoveryGracePeriod {
+		for tid, state := range b.awaitingContent {
+			if now.Sub(state.armedAt) >= contentRecoveryGracePeriod {
 				due = append(due, tid)
-				delete(b.awaitingContent, tid)
 			}
 		}
 		b.awaitingContentMu.Unlock()
 		for _, tid := range due {
-			b.recoverMissingMessages(ctx, tid)
+			b.awaitingContentMu.Lock()
+			state, exists := b.awaitingContent[tid]
+			if !exists {
+				b.awaitingContentMu.Unlock()
+				continue
+			}
+			state.attempts++
+			giveUp := state.attempts >= contentRecoveryMaxAttempts
+			if giveUp {
+				delete(b.awaitingContent, tid)
+			} else {
+				state.armedAt = time.Now()
+			}
+			b.awaitingContentMu.Unlock()
+
+			b.recoverMissingMessages(ctx, tid, state.attempts)
+			if giveUp {
+				b.log.Error().Int64("tid", tid).Int("attempts", state.attempts).Msg("giving up recovering marketplace thread content after max attempts")
+			}
 		}
 	}
 }
@@ -490,8 +519,8 @@ func (b *bot) contentRecoveryLoop(ctx context.Context) {
 //
 // This is still evidence-driven rather than a blind timer: it only fires when a specific thread
 // has been stuck with no content past the grace period, not on every tick regardless of need.
-func (b *bot) recoverMissingMessages(ctx context.Context, threadKey int64) {
-	b.log.Warn().Int64("tid", threadKey).Msg("no message content seen for new marketplace thread after grace period, forcing a resync")
+func (b *bot) recoverMissingMessages(ctx context.Context, threadKey int64, attempt int) {
+	b.log.Warn().Int64("tid", threadKey).Int("attempt", attempt).Msg("no message content seen for new marketplace thread after grace period, forcing a resync")
 	b.client.ForceReconnect()
 }
 
@@ -692,8 +721,17 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 		return
 	}
 
+	// Some mc/legacy redelivery routes (backlog resyncs in particular) come through with an
+	// empty MessageId, which used to bypass this dedup entirely and caused the same message to
+	// get replied to again once the cooldown had cleared. Fall back to a sender+text key so a
+	// blank ID doesn't defeat the check - this can only ever falsely suppress a genuine,
+	// deliberate resend of the exact same text in the same thread, which is far rarer than the
+	// duplicate-delivery case it fixes.
 	msgKey := fmt.Sprintf("%d:%s", threadID, msg.MessageId)
-	if msg.MessageId != "" && b.alreadyReplied(msgKey) {
+	if msg.MessageId == "" {
+		msgKey = fmt.Sprintf("%d:%d:%s", threadID, msg.SenderId, msg.Text)
+	}
+	if b.alreadyReplied(msgKey) {
 		b.log.Info().Int64("tid", threadID).Str("message_id", msg.MessageId).Msg("skipping already-replied message")
 		return
 	}
