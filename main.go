@@ -162,8 +162,14 @@ func run() error {
 	}
 	log := zerolog.New(&logFilter{out: zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: "3:04PM"}}).Level(lvl).With().Timestamp().Logger()
 	// messagix/whatsmeow are noisy at info/debug (socket internals, keepalives, dependency
-	// parsing) and that noise isn't ours to fix - only surface their warnings/errors.
+	// parsing) and that noise isn't ours to fix, so normally only their warnings/errors are
+	// surfaced. Set log_level to "debug" (or lower) in config.yaml to see their raw traffic
+	// too - useful for diagnosing messages that go missing between a healthy-looking socket
+	// and the bot's own handlers.
 	libLog := log.Level(zerolog.WarnLevel)
+	if lvl <= zerolog.DebugLevel {
+		libLog = log
+	}
 	// Some messagix internals (e.g. lightspeed/decode.go) log through zerolog's package-level
 	// global logger instead of the client-supplied one, bypassing libLog entirely. Route that
 	// through the same filtered writer and cap it at error level - its warnings are routine
@@ -930,6 +936,17 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 	}
 
 	if fbMsg.Info.IsFromMe {
+		b.selfSentMu.Lock()
+		isOurReply := fbMsg.Info.ID != "" && b.selfSentOtids[fbMsg.Info.ID]
+		b.selfSentMu.Unlock()
+		if isOurReply {
+			// This is the echo of a reply we just sent ourselves, not Brandon manually
+			// jumping into the thread from his phone/browser. Without this check, every
+			// e2ee auto-reply permanently silences the bot on that thread afterwards,
+			// since the echo is indistinguishable from real self-participation otherwise.
+			b.log.Debug().Int64("tid", tid).Str("message_id", fbMsg.Info.ID).Msg("e2ee: echo of our own reply, ignoring")
+			return
+		}
 		b.log.Info().Int64("tid", tid).Msg("e2ee: message from self, marking userThreads")
 		b.userThreadsMu.Lock()
 		b.userThreads[tid] = true
@@ -1048,9 +1065,15 @@ func (b *bot) sendE2EEReply(srcInfo waTypes.MessageInfo, threadID int64, text st
 			},
 		},
 	}
-	if _, err := b.waClient.SendFBMessage(context.Background(), srcInfo.Chat, msg, nil); err != nil {
+	resp, err := b.waClient.SendFBMessage(context.Background(), srcInfo.Chat, msg, nil)
+	if err != nil {
 		b.log.Err(err).Msg("Failed to send e2ee reply")
 		return
+	}
+	if resp.ID != "" {
+		b.selfSentMu.Lock()
+		b.selfSentOtids[resp.ID] = true
+		b.selfSentMu.Unlock()
 	}
 	b.log.Info().Msg("e2ee reply sent")
 	if err := b.waClient.MarkRead(context.Background(), []waTypes.MessageID{srcInfo.ID}, time.Now(), srcInfo.Chat, srcInfo.Sender); err != nil {
