@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -200,9 +201,25 @@ func run() error {
 
 	ctx := context.Background()
 
-	userInfo, initialTable, err := mc.LoadMessagesPage(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to load messages page: %w", err)
+	var userInfo types.UserInfo
+	var initialTable *table.LSTable
+	if state, readErr := os.ReadFile(connStateFile); readErr == nil {
+		if loadErr := mc.LoadState(state); loadErr != nil {
+			log.Warn().Err(loadErr).Msg("cached connection state unusable, doing full login")
+		} else if info, acctErr := mc.GetCurrentAccount(); acctErr != nil {
+			log.Warn().Err(acctErr).Msg("no account in cached connection state, doing full login")
+		} else if strconv.FormatInt(info.GetFBID(), 10) != cfg.Cookies["c_user"] {
+			log.Warn().Int64("cached_id", info.GetFBID()).Msg("cached connection state is for a different account, doing full login")
+		} else {
+			userInfo = info
+			log.Info().Msg("resumed from cached connection state")
+		}
+	}
+	if userInfo == nil {
+		userInfo, initialTable, err = mc.LoadMessagesPage(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to load messages page: %w", err)
+		}
 	}
 	log.Info().Str("name", userInfo.GetName()).Int64("id", userInfo.GetFBID()).Msg("Logged in")
 
@@ -268,12 +285,16 @@ func run() error {
 		deepseekKey:     deepseekKey,
 		httpClient:      &http.Client{Timeout: 30 * time.Second},
 		awaitingContent: make(map[int64]*awaitingContentState),
+		ctx:             ctx,
+		work:            make(chan func(), 64),
 	}
 
 	bot.recordThreadTypes(initialTable)
 
 	mc.SetEventHandler(bot.handleEvent)
 	waClient.AddEventHandler(bot.e2eeHandler)
+
+	go bot.workLoop()
 
 	go func() {
 		if err := mc.Connect(ctx); err != nil {
@@ -296,7 +317,7 @@ func run() error {
 	// past both of those.
 	reconnectInterval := time.Duration(cfg.ReconnectIntervalMinutes) * time.Minute
 	if reconnectInterval <= 0 {
-		reconnectInterval = 15 * time.Minute
+		reconnectInterval = 6 * time.Hour
 	}
 	go func() {
 		ticker := time.NewTicker(reconnectInterval)
@@ -310,12 +331,14 @@ func run() error {
 	if testThread > 0 {
 		time.Sleep(2 * time.Second)
 		log.Info().Int64("thread", testThread).Msg("injecting test message")
-		go bot.processMessage(ctx, &table.WrappedMessage{
-			LSInsertMessage: &table.LSInsertMessage{
-				Text:      "Is this available?",
-				ThreadKey: testThread,
-				SenderId:  bot.userID,
-			},
+		bot.enqueue(func() {
+			bot.processMessage(ctx, &table.WrappedMessage{
+				LSInsertMessage: &table.LSInsertMessage{
+					Text:      "Is this available?",
+					ThreadKey: testThread,
+					SenderId:  bot.userID,
+				},
+			})
 		})
 	}
 
@@ -324,6 +347,7 @@ func run() error {
 	<-sc
 
 	log.Info().Msg("Shutting down...")
+	bot.saveConnState()
 	mc.Disconnect()
 	waClient.Disconnect()
 	return nil
@@ -346,6 +370,15 @@ type bot struct {
 	replied   map[int64]map[int]bool
 	userID    int64
 	selfTest  bool
+
+	ctx  context.Context
+	work chan func()
+
+	restartMu      sync.Mutex
+	restartBackoff time.Duration
+
+	lastStateSave   time.Time
+	lastStateSaveMu sync.Mutex
 
 	startTime     time.Time
 	userThreads   map[int64]bool
@@ -392,6 +425,67 @@ const selfEchoGracePeriod = 30 * time.Second
 type awaitingContentState struct {
 	armedAt  time.Time
 	attempts int
+}
+
+const connStateFile = "conn_state.json"
+
+func (b *bot) enqueue(f func()) {
+	select {
+	case b.work <- f:
+	default:
+		b.log.Warn().Msg("work queue full, library event delivery is blocked until it drains")
+		b.work <- f
+	}
+}
+
+func (b *bot) workLoop() {
+	for f := range b.work {
+		f()
+	}
+}
+
+func (b *bot) saveConnState() {
+	b.lastStateSaveMu.Lock()
+	defer b.lastStateSaveMu.Unlock()
+	state, err := b.client.DumpState()
+	if err != nil {
+		b.log.Err(err).Msg("failed to dump connection state")
+		return
+	}
+	if state == nil {
+		return
+	}
+	if err := os.WriteFile(connStateFile, state, 0600); err != nil {
+		b.log.Err(err).Msg("failed to persist connection state")
+	}
+}
+
+func (b *bot) maybeSaveConnState() {
+	b.lastStateSaveMu.Lock()
+	if time.Since(b.lastStateSave) < time.Minute {
+		b.lastStateSaveMu.Unlock()
+		return
+	}
+	b.lastStateSave = time.Now()
+	b.lastStateSaveMu.Unlock()
+	b.saveConnState()
+}
+
+func (b *bot) restartMessenger() {
+	b.restartMu.Lock()
+	if b.restartBackoff == 0 {
+		b.restartBackoff = 5 * time.Second
+	} else if b.restartBackoff < 5*time.Minute {
+		b.restartBackoff *= 2
+	}
+	backoff := b.restartBackoff
+	b.restartMu.Unlock()
+	b.log.Error().Dur("retry_in", backoff).Msg("restarting messenger connection")
+	time.Sleep(backoff)
+	if err := b.client.Connect(b.ctx); err != nil {
+		b.log.Err(err).Msg("failed to restart messenger connection, retrying")
+		go b.restartMessenger()
+	}
 }
 
 func (b *bot) recordThreadTypes(tbl *table.LSTable) {
@@ -479,10 +573,9 @@ const (
 
 // contentRecoveryLoop watches for threads that were marked MARKETPLACE by the quick-reply CTA
 // but never got a real message delivered live over either the mc or e2ee socket - an observed
-// gap specifically for brand-new marketplace threads. Rather than reconnecting blindly on a
-// timer, it forces a resync once the grace period elapses. A single attempt isn't always
-// enough (the resync it triggers doesn't always happen to land on the thread being recovered),
-// so it retries up to contentRecoveryMaxAttempts times before giving up.
+// gap specifically for brand-new marketplace threads. Once the grace period elapses it tries a
+// targeted thread fetch (what messenger web does for a thread it only has a bare reference to),
+// falling back to a full resync on the final attempt.
 func (b *bot) contentRecoveryLoop(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -520,49 +613,63 @@ func (b *bot) contentRecoveryLoop(ctx context.Context) {
 	}
 }
 
-// recoverMissingMessages forces the mc connection to reconnect, which triggers a full backlog
-// resync - the only mechanism that's actually been observed to surface a brand-new marketplace
-// thread's first message when it doesn't arrive live over either the mc or e2ee socket.
-//
-// FetchMessagesTask (the real mautrix-meta bridge's backfill call) was tried first here, but it's
-// pure backward pagination: it requires a MinTimestampMs/MinMessageId anchor from a
-// LSUpsertSyncGroupThreadsRange the thread already has. A genuinely brand-new thread has no such
-// anchor yet, so the request comes back with nothing to give - confirmed live, not a guess.
-//
-// This is still evidence-driven rather than a blind timer: it only fires when a specific thread
-// has been stuck with no content past the grace period, not on every tick regardless of need.
+// recoverMissingMessages surfaces a brand-new marketplace thread's first message when it
+// doesn't arrive live over either socket. FetchMessagesTask (the real mautrix-meta bridge's
+// backfill call) doesn't work here: it's pure backward pagination requiring a
+// MinTimestampMs/MinMessageId anchor from a LSUpsertSyncGroupThreadsRange the thread already
+// has, which a genuinely brand-new thread lacks. CreateThreadTask is what the bridge sends for
+// threads it only has a bare LSVerifyThreadExists for, so try that first; the final attempt
+// forces a full resync via reconnect, the one mechanism confirmed live to work.
 func (b *bot) recoverMissingMessages(ctx context.Context, threadKey int64, attempt int) {
-	b.log.Warn().Int64("tid", threadKey).Int("attempt", attempt).Msg("no message content seen for new marketplace thread after grace period, forcing a resync")
-	b.client.ForceReconnect()
+	if attempt >= contentRecoveryMaxAttempts {
+		b.log.Warn().Int64("tid", threadKey).Int("attempt", attempt).Msg("no message content seen for new marketplace thread after grace period, forcing a resync")
+		b.client.ForceReconnect()
+		return
+	}
+	b.log.Warn().Int64("tid", threadKey).Int("attempt", attempt).Msg("no message content seen for new marketplace thread after grace period, requesting thread directly")
+	resp, err := b.client.ExecuteTasks(ctx, &socket.CreateThreadTask{
+		ThreadFBID:                threadKey,
+		ForceUpsert:               0,
+		UseOpenMessengerTransport: 0,
+		SyncGroup:                 1,
+		MetadataOnly:              0,
+		PreviewOnly:               0,
+	})
+	if err != nil {
+		b.log.Err(err).Int64("tid", threadKey).Msg("failed to fetch thread for content recovery")
+		return
+	}
+	if resp != nil {
+		b.enqueue(func() { b.processTable(b.ctx, resp) })
+	}
 }
 
 func (b *bot) handleEvent(ctx context.Context, evt any) {
-	var tbl *table.LSTable
 	switch e := evt.(type) {
 	case *messagix.Event_PublishResponse:
-		tbl = e.Table
+		tbl := e.Table
+		b.enqueue(func() { b.processTable(b.ctx, tbl) })
 	case *messagix.Event_PermanentError:
+		if errors.Is(e.Err, messagix.CONNECTION_REFUSED_UNAUTHORIZED) ||
+			errors.Is(e.Err, messagix.CONNECTION_REFUSED_BAD_USERNAME_OR_PASSWORD) {
+			// Retrying rejected credentials reconnects in a zero-backoff loop, hammering Meta
+			// with doomed auth attempts. Nothing recovers without fresh cookies.
+			os.Remove(connStateFile)
+			b.log.Fatal().Err(e.Err).Msg("messenger credentials rejected by server, update cookies in config.yaml")
+		}
 		// messagix's own reconnect loop (in Client.Connect) gives up for good after this -
 		// it will never retry again on its own. We're the only thing that can bring the
 		// messenger socket back.
-		b.log.Error().Err(e.Err).Msg("messenger socket permanently failed, restarting connection")
-		go func() {
-			if err := b.client.Connect(ctx); err != nil {
-				b.log.Err(err).Msg("failed to restart messenger connection")
-			}
-		}()
-		return
+		b.log.Error().Err(e.Err).Msg("messenger socket permanently failed")
+		go b.restartMessenger()
 	case *messagix.Event_SocketError:
 		b.log.Warn().Err(e.Err).Int("attempt", e.ConnectionAttempts).Msg("messenger socket error, library is retrying")
-		return
 	case *messagix.Event_Reconnected:
+		b.restartMu.Lock()
+		b.restartBackoff = 0
+		b.restartMu.Unlock()
 		b.log.Info().Msg("messenger socket reconnected")
-		return
-	default:
-		return
 	}
-
-	b.processTable(ctx, tbl)
 }
 
 // processTable applies an LSTable to bot state and dispatches any messages in it. It's shared
@@ -582,8 +689,9 @@ func (b *bot) processTable(ctx context.Context, tbl *table.LSTable) {
 		b.contactNamesMu.Unlock()
 	}
 
-	b.selfSentMu.Lock()
 	isSelfSent := func(ids ...string) bool {
+		b.selfSentMu.Lock()
+		defer b.selfSentMu.Unlock()
 		for _, id := range ids {
 			if id != "" && b.selfSentOtids[id] {
 				return true
@@ -591,7 +699,6 @@ func (b *bot) processTable(ctx context.Context, tbl *table.LSTable) {
 		}
 		return false
 	}
-	b.selfSentMu.Unlock()
 	// Belt-and-braces on top of the MessageId/OfflineThreadingId check above: if that ID
 	// tracking ever misses for some other reason, still don't mark a thread as user-participated
 	// from something landing right after we know we just replied there ourselves.
@@ -646,6 +753,11 @@ func (b *bot) processTable(ctx context.Context, tbl *table.LSTable) {
 			}
 		}
 	}
+
+	if tbl != nil {
+		b.client.PostHandlePublishResponse(tbl)
+	}
+	b.maybeSaveConnState()
 }
 
 func (b *bot) extractListing(msg *table.WrappedMessage) *listing {
@@ -828,7 +940,7 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 	// Mark read as soon as we've decided to handle this message, not only when a reply is
 	// actually sent - otherwise any message that fails to match a rule (or gets an empty AI
 	// reply) is left unread forever, which is exactly what still triggers the phone notification.
-	b.markThreadRead(ctx, threadID)
+	b.markThreadRead(ctx, threadID, msg.TimestampMs)
 
 	if b.deepseekKey != "" {
 		reply, err := b.callDeepseek(b.buildPrompt(threadID), text)
@@ -849,12 +961,15 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 	for i, rule := range b.rules {
 		if rule.compiled.MatchString(text) {
 			if b.replyOnce {
+				b.repliedMu.Lock()
 				rset, ok := b.replied[threadID]
 				if !ok {
 					rset = make(map[int]bool)
 					b.replied[threadID] = rset
 				}
-				if rset[i] {
+				seen := rset[i]
+				b.repliedMu.Unlock()
+				if seen {
 					continue
 				}
 			}
@@ -868,10 +983,10 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 			// sent - marking it beforehand meant a failed send (e.g. a reconnect racing the
 			// send) would permanently mark the message as handled despite never answering it.
 			if b.sendReply(ctx, threadID, rule.Reply) {
+				b.repliedMu.Lock()
 				if b.replyOnce {
 					b.replied[threadID][i] = true
 				}
-				b.repliedMu.Lock()
 				b.lastReplyAt[threadID] = time.Now()
 				b.repliedMu.Unlock()
 				b.markReplied(msgKey)
@@ -999,11 +1114,14 @@ func loadSelfSentIDs(path string) (map[string]bool, error) {
 
 const markReadMaxAttempts = 3
 
-func (b *bot) markThreadRead(ctx context.Context, threadID int64) {
+func (b *bot) markThreadRead(ctx context.Context, threadID int64, watermarkMs int64) {
+	if watermarkMs <= 0 {
+		watermarkMs = time.Now().UnixMilli()
+	}
 	for attempt := 1; attempt <= markReadMaxAttempts; attempt++ {
 		task := &socket.ThreadMarkReadTask{
 			ThreadId:            threadID,
-			LastReadWatermarkTs: time.Now().UnixMilli(),
+			LastReadWatermarkTs: watermarkMs,
 			SyncGroup:           1,
 		}
 		resp, err := b.client.ExecuteTasks(ctx, task)
@@ -1062,25 +1180,53 @@ func (b *bot) sendReply(ctx context.Context, threadID int64, text string) bool {
 	otidStr := strconv.FormatInt(otid, 10)
 	b.recordSelfSent(otidStr)
 
-	resp, err := b.client.ExecuteTasks(ctx, task)
+	var resp *table.LSTable
+	var err error
+	for range 5 {
+		if werr := b.client.WaitUntilCanSendMessages(ctx, 15*time.Second); werr != nil {
+			b.log.Err(werr).Msg("messenger socket not ready for sending, retrying")
+			err = werr
+			continue
+		}
+		resp, err = b.client.ExecuteTasks(ctx, task)
+		if err == nil {
+			break
+		}
+		b.log.Err(err).Msg("failed to send reply, retrying")
+	}
 	if err != nil {
 		b.log.Err(err).Msg("Failed to send reply")
 		return false
 	}
-	// The real message ID assigned to this send only appears here, in
-	// LSReplaceOptimsiticMessage matched by our Otid (this is how the real mautrix-meta bridge
-	// tracks its own sent messages too - see pkg/connector/handlematrix.go). The OfflineThreadingId
-	// on a *later* echoed LSInsertMessage/LSUpsertMessage doesn't reliably match our Otid for a
-	// reply sent into a thread that's e2ee underneath, which was silently marking the thread as
-	// user-participated and permanently killing auto-replies there. Recording the real ID here
-	// gives the self-sent check something that actually matches on replay.
+	// A transport-level success can still be a server-side rejection: the send is only
+	// confirmed by LSReplaceOptimsiticMessage carrying our Otid, with the real message ID.
+	// That ID is also the only self-sent marker that reliably matches on replay - the
+	// OfflineThreadingId on a later echoed LSInsertMessage/LSUpsertMessage doesn't reliably
+	// match our Otid for a reply sent into a thread that's e2ee underneath, which was
+	// silently marking the thread as user-participated and permanently killing auto-replies.
+	var msgID string
 	if resp != nil {
 		for _, replace := range resp.LSReplaceOptimsiticMessage {
-			if replace.OfflineThreadingId == otidStr && replace.MessageId != "" {
-				b.recordSelfSent(replace.MessageId)
+			if replace.OfflineThreadingId == otidStr {
+				msgID = replace.MessageId
+			}
+		}
+		for _, failed := range resp.LSMarkOptimisticMessageFailed {
+			if failed.OTID == otidStr {
+				b.log.Warn().Str("reason", failed.Message).Msg("server rejected reply")
+			}
+		}
+		for _, failed := range resp.LSHandleFailedTask {
+			if failed.OTID == otidStr {
+				b.log.Warn().Str("reason", failed.Message).Msg("reply task failed server-side")
 			}
 		}
 	}
+	if msgID == "" {
+		b.log.Warn().Msg("send response didn't confirm our message, treating as failure")
+		return false
+	}
+	b.recordSelfSent(msgID)
 	b.log.Info().Msg("reply sent")
 	return true
 }
@@ -1089,7 +1235,7 @@ func (b *bot) e2eeHandler(evt any) {
 	b.log.Debug().Str("type", fmt.Sprintf("%T", evt)).Msg("e2ee event")
 	switch evt := evt.(type) {
 	case *waEvents.FBMessage:
-		b.handleE2EEMessage(evt)
+		b.enqueue(func() { b.handleE2EEMessage(evt) })
 	case *waEvents.Connected:
 		b.log.Info().Msg("e2ee socket connected")
 		// Marks us as an active/foreground client. Without this, delivery receipts go out as
@@ -1262,12 +1408,15 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 	for i, rule := range b.rules {
 		if rule.compiled.MatchString(text) {
 			if b.replyOnce {
+				b.repliedMu.Lock()
 				rset, ok := b.replied[tid]
 				if !ok {
 					rset = make(map[int]bool)
 					b.replied[tid] = rset
 				}
-				if rset[i] {
+				seen := rset[i]
+				b.repliedMu.Unlock()
+				if seen {
 					continue
 				}
 			}
@@ -1278,10 +1427,10 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 				Msg("auto-replying (e2ee)")
 
 			if b.sendE2EEReply(fbMsg.Info, tid, rule.Reply) {
+				b.repliedMu.Lock()
 				if b.replyOnce {
 					b.replied[tid][i] = true
 				}
-				b.repliedMu.Lock()
 				b.lastReplyAt[tid] = time.Now()
 				b.repliedMu.Unlock()
 				b.markReplied(msgKey)
@@ -1314,12 +1463,30 @@ func (b *bot) sendE2EEReply(srcInfo waTypes.MessageInfo, threadID int64, text st
 			},
 		},
 	}
-	resp, err := b.waClient.SendFBMessage(context.Background(), srcInfo.Chat, msg, nil)
-	if err != nil {
-		b.log.Err(err).Msg("Failed to send e2ee reply")
+	otidStr := strconv.FormatInt(methods.GenerateEpochID(), 10)
+	b.recordSelfSent(otidStr)
+	var resp whatsmeow.SendResponse
+	sent := false
+	for attempt := range 5 {
+		if !b.waClient.IsConnected() {
+			b.log.Warn().Msg("e2ee socket not connected, waiting before retry")
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		var err error
+		resp, err = b.waClient.SendFBMessage(context.Background(), srcInfo.Chat, msg, nil, whatsmeow.SendRequestExtra{ID: waTypes.MessageID(otidStr)})
+		if err == nil {
+			sent = true
+			break
+		}
+		b.log.Err(err).Msg("failed to send e2ee reply, retrying")
+		time.Sleep(time.Duration(attempt+1) * time.Second)
+	}
+	if !sent {
+		b.log.Error().Msg("Failed to send e2ee reply")
 		return false
 	}
-	if resp.ID != "" {
+	if resp.ID != "" && resp.ID != otidStr {
 		b.recordSelfSent(resp.ID)
 	}
 	b.log.Info().Msg("e2ee reply sent")

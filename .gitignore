@@ -4,3 +4,4 @@ config.yaml
 vendor/
 .env
 device.db
+conn_state.json

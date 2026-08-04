@@ -15,7 +15,7 @@ rules:
 
 reply_once: true
 reply_cooldown_minutes: 5
-reconnect_interval_minutes: 15
+reconnect_interval_minutes: 360
 log_level: "info"
 
 # Leave blank to use rule-based replies only.
