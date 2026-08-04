@@ -446,6 +446,7 @@ func (b *bot) recordThreadTypes(tbl *table.LSTable) {
 			b.log.Debug().
 				Str("source", "LSInsertAttachmentCta").
 				Int64("tid", cta.ThreadKey).
+				Str("cta_message_id", cta.MessageId).
 				Msg("marking thread as marketplace from quick-reply CTA")
 			b.threadTypes[cta.ThreadKey] = table.MARKETPLACE
 			b.armContentRecovery(cta.ThreadKey)
@@ -824,6 +825,11 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 		Str("text", text).
 		Msg("new message")
 
+	// Mark read as soon as we've decided to handle this message, not only when a reply is
+	// actually sent - otherwise any message that fails to match a rule (or gets an empty AI
+	// reply) is left unread forever, which is exactly what still triggers the phone notification.
+	b.markThreadRead(ctx, threadID)
+
 	if b.deepseekKey != "" {
 		reply, err := b.callDeepseek(b.buildPrompt(threadID), text)
 		if err != nil {
@@ -1076,7 +1082,6 @@ func (b *bot) sendReply(ctx context.Context, threadID int64, text string) bool {
 		}
 	}
 	b.log.Info().Msg("reply sent")
-	b.markThreadRead(ctx, threadID)
 	return true
 }
 
@@ -1229,6 +1234,11 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 		Str("text", text).
 		Msg("e2ee message")
 
+	// Mark read as soon as we've decided to handle this message, not only when a reply is
+	// actually sent - otherwise any message that fails to match a rule (or gets an empty AI
+	// reply) is left unread forever, which is exactly what still triggers the phone notification.
+	b.markE2EEThreadRead(tid, fbMsg.Info)
+
 	if sid == b.userID {
 		return
 	}
@@ -1313,10 +1323,16 @@ func (b *bot) sendE2EEReply(srcInfo waTypes.MessageInfo, threadID int64, text st
 		b.recordSelfSent(resp.ID)
 	}
 	b.log.Info().Msg("e2ee reply sent")
+	return true
+}
+
+func (b *bot) markE2EEThreadRead(threadID int64, srcInfo waTypes.MessageInfo) {
+	if b.waClient == nil {
+		return
+	}
 	if err := b.waClient.MarkRead(context.Background(), []waTypes.MessageID{srcInfo.ID}, time.Now(), srcInfo.Chat, srcInfo.Sender); err != nil {
 		b.log.Err(err).Int64("tid", threadID).Msg("failed to mark e2ee thread read")
 	}
-	return true
 }
 
 func loadConfig(path string) (*config, error) {
