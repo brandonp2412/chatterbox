@@ -1,21 +1,6 @@
 # chatterbox
 
-Auto-reply bot for Facebook Marketplace messages. Talks directly to Facebook
-Messenger (no Matrix homeserver or bridge needed). Built on the
-[messagix](https://github.com/mautrix/meta/tree/main/pkg/messagix) library from
-[mautrix/meta](https://github.com/mautrix/meta).
-
-## How it works
-
-chatterbox logs in to Facebook Messenger with your browser cookies, connects to
-Facebook's internal WebSocket (the Lightspeed/DGW protocol), listens for
-incoming messages, and auto-replies based on configurable regex rules.
-
-```
-Facebook Messenger  <--WebSocket-->  chatterbox
-```
-
-No Matrix, no bridge, no homeserver — just Go and your Facebook session.
+Auto-reply bot for Facebook Marketplace messages. 
 
 ## Setup
 
@@ -103,23 +88,3 @@ When `true` (default), each rule fires at most once per chat thread. Set to
 ```yaml
 reply_once: false
 ```
-
-## Under the hood
-
-mauitrix/meta's `messagix` package implements Facebook Messenger's internal
-protocol stack:
-
-- **Authentication**: Browser cookies (`c_user`, `xs`, `datr`) sent as HTTP
-  headers — no API keys.
-- **WebSocket**: Facebook's DGW (Data Gateway) at
-  `wss://gateway.facebook.com/ws/lightspeed` with multiplexed streams.
-- **Application protocol**: Lightspeed — JSON task payloads over the
-  WebSocket. Sending a message is a task with label `46` (SendMessageTask).
-- **Message receipt**: Database sync over the socket via cursor-based
-  streams. Responses contain `LSTable` objects with operations like
-  `LSInsertNewMessageRange`.
-- **E2EE chats**: Uses WhatsApp's Signal-based encryption via the
-  `go.mau.fi/whatsmeow` library.
-
-All of this is handled transparently by the messagix library. chatterbox
-just hooks into the event stream and sends replies.
