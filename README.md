@@ -88,3 +88,9 @@ When `true` (default), each rule fires at most once per chat thread. Set to
 ```yaml
 reply_once: false
 ```
+
+### Logging
+
+Logs obscure message content, names, contact details, account/thread/message identifiers, and
+credentials by default. Set `log_level: "debug"` only while diagnosing an issue if raw values are
+needed; debug and trace logging intentionally leave PII visible.

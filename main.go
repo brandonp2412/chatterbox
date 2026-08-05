@@ -58,24 +58,40 @@ type config struct {
 }
 
 type logFilter struct {
-	out io.Writer
+	out       io.Writer
+	redactPII bool
 }
 
 func (f *logFilter) Write(p []byte) (n int, err error) {
 	if f.skip(p) {
 		return len(p), nil
 	}
-	return f.out.Write(p)
+	return f.write(p, zerolog.NoLevel)
 }
 
 func (f *logFilter) WriteLevel(lvl zerolog.Level, p []byte) (n int, err error) {
 	if f.skip(p) {
 		return len(p), nil
 	}
-	if lw, ok := f.out.(zerolog.LevelWriter); ok {
-		return lw.WriteLevel(lvl, p)
+	return f.write(p, lvl)
+}
+
+func (f *logFilter) write(p []byte, lvl zerolog.Level) (n int, err error) {
+	output := p
+	if f.redactPII {
+		output = redactLogPII(p)
 	}
-	return f.out.Write(p)
+
+	// Writers conventionally report the number of input bytes consumed. Redaction changes the
+	// output length, but the complete original event was handled even when its replacement is
+	// shorter.
+	var writeErr error
+	if lw, ok := f.out.(zerolog.LevelWriter); ok {
+		_, writeErr = lw.WriteLevel(lvl, output)
+	} else {
+		_, writeErr = f.out.Write(output)
+	}
+	return len(p), writeErr
 }
 
 var skipPatterns = [][]byte{
@@ -90,6 +106,93 @@ func (f *logFilter) skip(p []byte) bool {
 		}
 	}
 	return false
+}
+
+const redactedLogValue = "[REDACTED]"
+
+var piiKeyParts = []string{
+	"account", "address", "auth", "chat", "contact", "cookie", "email", "jid",
+	"location", "name", "password", "phone", "reply", "secret", "sender", "text",
+	"thread", "token", "url", "uri", "user",
+}
+
+var piiValuePatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b`),
+	regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`),
+	regexp.MustCompile(`(?i)\b(?:https?|wss?)://[^\s"']+`),
+	regexp.MustCompile(`(?i)\b(?:bearer|basic)\s+[A-Z0-9._~+/=-]+`),
+	regexp.MustCompile(`(?:\+?\d[\d ()-]{6,}\d)`),
+}
+
+// redactLogPII operates on the structured zerolog event before ConsoleWriter renders it. This
+// covers application and dependency logs at one boundary, including nested dependency payloads.
+func redactLogPII(p []byte) []byte {
+	decoder := json.NewDecoder(bytes.NewReader(p))
+	decoder.UseNumber()
+	var event any
+	if err := decoder.Decode(&event); err != nil {
+		return []byte(redactPIIInString(string(p)))
+	}
+
+	event = redactPIIValue("", event)
+	redacted, err := json.Marshal(event)
+	if err != nil {
+		return []byte(redactPIIInString(string(p)))
+	}
+	if bytes.HasSuffix(p, []byte("\n")) {
+		redacted = append(redacted, '\n')
+	}
+	return redacted
+}
+
+func redactPIIValue(key string, value any) any {
+	if isPIIKey(key) {
+		return redactedLogValue
+	}
+	switch value := value.(type) {
+	case map[string]any:
+		for childKey, childValue := range value {
+			value[childKey] = redactPIIValue(childKey, childValue)
+		}
+		return value
+	case []any:
+		for i, childValue := range value {
+			value[i] = redactPIIValue(key, childValue)
+		}
+		return value
+	case string:
+		// Altering zerolog's standard metadata can make ConsoleWriter reject the event.
+		if key == zerolog.TimestampFieldName || key == zerolog.LevelFieldName {
+			return value
+		}
+		return redactPIIInString(value)
+	default:
+		return value
+	}
+}
+
+func isPIIKey(key string) bool {
+	normalized := strings.ToLower(strings.ReplaceAll(key, "-", "_"))
+	if normalized == "id" || normalized == "ip" || normalized == "sid" ||
+		normalized == "tid" || normalized == "source" || normalized == "subtitle" ||
+		normalized == "title" || normalized == "error" || normalized == "reason" ||
+		normalized == "body" || normalized == "content" ||
+		strings.HasSuffix(normalized, "id") || strings.HasSuffix(normalized, "_ip") {
+		return true
+	}
+	for _, part := range piiKeyParts {
+		if strings.Contains(normalized, part) {
+			return true
+		}
+	}
+	return false
+}
+
+func redactPIIInString(value string) string {
+	for _, pattern := range piiValuePatterns {
+		value = pattern.ReplaceAllString(value, redactedLogValue)
+	}
+	return value
 }
 
 var defaultRules = []rule{
@@ -162,7 +265,11 @@ func run() error {
 	if selfTest && lvl < zerolog.DebugLevel {
 		lvl = zerolog.DebugLevel
 	}
-	log := zerolog.New(&logFilter{out: zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: "3:04PM"}}).Level(lvl).With().Timestamp().Logger()
+	redactPII := lvl > zerolog.DebugLevel
+	log := zerolog.New(&logFilter{
+		out:       zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: "3:04PM"},
+		redactPII: redactPII,
+	}).Level(lvl).With().Timestamp().Logger()
 	// messagix/whatsmeow are noisy at info/debug (socket internals, keepalives, dependency
 	// parsing) and that noise isn't ours to fix, so normally only their warnings/errors are
 	// surfaced. Set log_level to "debug" (or lower) in config.yaml to see their raw traffic
@@ -176,7 +283,10 @@ func run() error {
 	// global logger instead of the client-supplied one, bypassing libLog entirely. Route that
 	// through the same filtered writer and cap it at error level - its warnings are routine
 	// dependency-parsing noise, not something we can act on.
-	zlog.Logger = zlog.Logger.Output(&logFilter{out: zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: "3:04PM"}}).Level(zerolog.ErrorLevel)
+	zlog.Logger = zlog.Logger.Output(&logFilter{
+		out:       zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: "3:04PM"},
+		redactPII: redactPII,
+	}).Level(zerolog.ErrorLevel)
 
 	mode := types.PlatformFromString(cfg.Mode)
 	if mode == types.Unset {
