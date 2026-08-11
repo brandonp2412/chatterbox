@@ -201,6 +201,8 @@ var defaultRules = []rule{
 	{Pattern: `(?i)(?:condition|used|new)`, Reply: "It's in good condition. Let me know if you'd like more photos."},
 }
 
+const marketplaceAvailabilityGreeting = "Hi, is this available?"
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "chatterbox: %v\n", err)
@@ -374,29 +376,30 @@ func run() error {
 	log.Info().Int("count", len(selfSentOtids)).Msg("loaded self-sent message ids")
 
 	bot := &bot{
-		log:             log,
-		client:          mc,
-		waClient:        waClient,
-		rules:           cfg.Rules,
-		replyOnce:       cfg.ReplyOnce && !selfTest,
-		replied:         make(map[int64]map[int]bool),
-		userID:          userInfo.GetFBID(),
-		selfTest:        selfTest,
-		startTime:       time.Now(),
-		userThreads:     make(map[int64]bool),
-		lastReplyAt:     make(map[int64]time.Time),
-		replyCooldown:   replyCooldown,
-		selfSentOtids:   selfSentOtids,
-		repliedMsgIDs:   make(map[string]bool),
-		listings:        make(map[int64]*listing),
-		threadTypes:     make(map[int64]table.ThreadType),
-		contactNames:    make(map[int64]string),
-		devContacts:     devContactIDs,
-		deepseekKey:     deepseekKey,
-		httpClient:      &http.Client{Timeout: 30 * time.Second},
-		awaitingContent: make(map[int64]*awaitingContentState),
-		ctx:             ctx,
-		work:            make(chan func(), 64),
+		log:                      log,
+		client:                   mc,
+		waClient:                 waClient,
+		rules:                    cfg.Rules,
+		replyOnce:                cfg.ReplyOnce && !selfTest,
+		replied:                  make(map[int64]map[int]bool),
+		userID:                   userInfo.GetFBID(),
+		selfTest:                 selfTest,
+		startTime:                time.Now(),
+		userThreads:              make(map[int64]bool),
+		lastReplyAt:              make(map[int64]time.Time),
+		replyCooldown:            replyCooldown,
+		selfSentOtids:            selfSentOtids,
+		repliedMsgIDs:            make(map[string]bool),
+		listings:                 make(map[int64]*listing),
+		threadTypes:              make(map[int64]table.ThreadType),
+		authoritativeThreadTypes: make(map[int64]bool),
+		contactNames:             make(map[int64]string),
+		devContacts:              devContactIDs,
+		deepseekKey:              deepseekKey,
+		httpClient:               &http.Client{Timeout: 30 * time.Second},
+		awaitingContent:          make(map[int64]*awaitingContentState),
+		ctx:                      ctx,
+		work:                     make(chan func(), 64),
 	}
 
 	bot.recordThreadTypes(initialTable)
@@ -506,12 +509,16 @@ type bot struct {
 	repliedMsgIDs   map[string]bool
 	repliedMsgIDsMu sync.Mutex
 
-	listings      map[int64]*listing
-	listingsMu    sync.RWMutex
-	threadTypes   map[int64]table.ThreadType
-	threadTypesMu sync.RWMutex
-	deepseekKey   string
-	httpClient    *http.Client
+	listings    map[int64]*listing
+	listingsMu  sync.RWMutex
+	threadTypes map[int64]table.ThreadType
+	// authoritativeThreadTypes distinguishes complete thread metadata from the generic
+	// LSVerifyThreadExists hint. Meta reports new Marketplace inquiries as GROUP_THREAD in
+	// that hint, so it is not safe to reject them until CreateThreadTask returns the full row.
+	authoritativeThreadTypes map[int64]bool
+	threadTypesMu            sync.RWMutex
+	deepseekKey              string
+	httpClient               *http.Client
 
 	contactNames   map[int64]string
 	contactNamesMu sync.RWMutex
@@ -533,8 +540,9 @@ type bot struct {
 const selfEchoGracePeriod = 30 * time.Second
 
 type awaitingContentState struct {
-	armedAt  time.Time
-	attempts int
+	armedAt             time.Time
+	attempts            int
+	needsClassification bool
 }
 
 const connStateFile = "conn_state.json"
@@ -634,11 +642,20 @@ func (b *bot) recordThreadTypes(tbl *table.LSTable) {
 	}
 
 	b.threadTypesMu.Lock()
+	if b.authoritativeThreadTypes == nil {
+		b.authoritativeThreadTypes = make(map[int64]bool)
+	}
 	for _, t := range tbl.LSDeleteThenInsertThread {
 		set("LSDeleteThenInsertThread", t.ThreadKey, t.ThreadType)
+		if t.ThreadType != table.GROUP_THREAD {
+			b.authoritativeThreadTypes[t.ThreadKey] = true
+		}
 	}
 	for _, t := range tbl.LSUpdateOrInsertThread {
 		set("LSUpdateOrInsertThread", t.ThreadKey, t.ThreadType)
+		if t.ThreadType != table.GROUP_THREAD {
+			b.authoritativeThreadTypes[t.ThreadKey] = true
+		}
 	}
 	for _, cta := range tbl.LSInsertAttachmentCta {
 		// Brand new marketplace threads never get a LSDeleteThenInsertThread/LSUpdateOrInsertThread
@@ -653,6 +670,7 @@ func (b *bot) recordThreadTypes(tbl *table.LSTable) {
 				Str("cta_message_id", cta.MessageId).
 				Msg("marking thread as marketplace from quick-reply CTA")
 			b.threadTypes[cta.ThreadKey] = table.MARKETPLACE
+			b.authoritativeThreadTypes[cta.ThreadKey] = true
 			b.armContentRecovery(cta.ThreadKey)
 		}
 	}
@@ -664,8 +682,23 @@ func (b *bot) recordThreadTypes(tbl *table.LSTable) {
 
 func (b *bot) armContentRecovery(threadKey int64) {
 	b.awaitingContentMu.Lock()
-	if _, exists := b.awaitingContent[threadKey]; !exists {
+	if state, exists := b.awaitingContent[threadKey]; exists {
+		// A Marketplace CTA is authoritative. If this recovery started only to classify a
+		// generic thread, keep it armed but switch it to ordinary missing-content recovery.
+		state.needsClassification = false
+	} else {
 		b.awaitingContent[threadKey] = &awaitingContentState{armedAt: time.Now()}
+	}
+	b.awaitingContentMu.Unlock()
+}
+
+func (b *bot) armClassificationRecovery(threadKey int64) {
+	b.awaitingContentMu.Lock()
+	if _, exists := b.awaitingContent[threadKey]; !exists {
+		b.awaitingContent[threadKey] = &awaitingContentState{
+			armedAt:             time.Now(),
+			needsClassification: true,
+		}
 	}
 	b.awaitingContentMu.Unlock()
 }
@@ -715,7 +748,7 @@ func (b *bot) contentRecoveryLoop(ctx context.Context) {
 			}
 			b.awaitingContentMu.Unlock()
 
-			b.recoverMissingMessages(ctx, tid, state.attempts)
+			b.recoverMissingMessages(ctx, tid, state.attempts, state.needsClassification)
 			if giveUp {
 				b.log.Error().Int64("tid", tid).Int("attempts", state.attempts).Msg("giving up recovering marketplace thread content after max attempts")
 			}
@@ -730,7 +763,7 @@ func (b *bot) contentRecoveryLoop(ctx context.Context) {
 // has, which a genuinely brand-new thread lacks. CreateThreadTask is what the bridge sends for
 // threads it only has a bare LSVerifyThreadExists for, so try that first; the final attempt
 // forces a full resync via reconnect, the one mechanism confirmed live to work.
-func (b *bot) recoverMissingMessages(ctx context.Context, threadKey int64, attempt int) {
+func (b *bot) recoverMissingMessages(ctx context.Context, threadKey int64, attempt int, needsClassification bool) {
 	if attempt >= contentRecoveryMaxAttempts {
 		b.log.Warn().Int64("tid", threadKey).Int("attempt", attempt).Msg("no message content seen for new marketplace thread after grace period, forcing a resync")
 		b.client.ForceReconnect()
@@ -750,8 +783,55 @@ func (b *bot) recoverMissingMessages(ctx context.Context, threadKey int64, attem
 		return
 	}
 	if resp != nil {
+		if needsClassification {
+			if responseClassifiesMarketplace(resp, threadKey) {
+				b.awaitingContentMu.Lock()
+				if state := b.awaitingContent[threadKey]; state != nil {
+					state.needsClassification = false
+				}
+				b.awaitingContentMu.Unlock()
+			} else if responseConfirmsNonMarketplace(resp, threadKey) {
+				// The full row confirms this really is a normal Messenger thread. Stop the
+				// recovery without ever feeding it to the auto-reply rules.
+				b.clearContentRecovery(threadKey)
+				b.log.Info().Int64("tid", threadKey).Msg("confirmed non-marketplace thread")
+			}
+		}
 		b.enqueue(func() { b.processTable(b.ctx, resp) })
 	}
+}
+
+func responseConfirmsNonMarketplace(tbl *table.LSTable, threadKey int64) bool {
+	for _, thread := range tbl.LSDeleteThenInsertThread {
+		if thread.ThreadKey == threadKey && thread.ThreadType != table.GROUP_THREAD && thread.ThreadType != table.MARKETPLACE {
+			return true
+		}
+	}
+	for _, thread := range tbl.LSUpdateOrInsertThread {
+		if thread.ThreadKey == threadKey && thread.ThreadType != table.GROUP_THREAD && thread.ThreadType != table.MARKETPLACE {
+			return true
+		}
+	}
+	return false
+}
+
+func responseClassifiesMarketplace(tbl *table.LSTable, threadKey int64) bool {
+	for _, thread := range tbl.LSDeleteThenInsertThread {
+		if thread.ThreadKey == threadKey && thread.ThreadType == table.MARKETPLACE {
+			return true
+		}
+	}
+	for _, thread := range tbl.LSUpdateOrInsertThread {
+		if thread.ThreadKey == threadKey && thread.ThreadType == table.MARKETPLACE {
+			return true
+		}
+	}
+	for _, cta := range tbl.LSInsertAttachmentCta {
+		if cta.ThreadKey == threadKey && cta.Type_ == "marketplace_xma_call_function" {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *bot) handleEvent(ctx context.Context, evt any) {
@@ -940,6 +1020,36 @@ func (b *bot) marketplaceThread(threadKey int64) bool {
 	return ok && tt == table.MARKETPLACE
 }
 
+func (b *bot) threadNeedsClassification(threadKey int64) bool {
+	b.threadTypesMu.RLock()
+	tt, known := b.threadTypes[threadKey]
+	authoritative := b.authoritativeThreadTypes[threadKey]
+	b.threadTypesMu.RUnlock()
+	return known && tt == table.GROUP_THREAD && !authoritative
+}
+
+// classifyMarketplaceGreeting is a high-precision fallback for Meta dropping both the
+// Marketplace thread type and its quick-reply CTA. Facebook generates this exact,
+// case-sensitive phrase for Marketplace inquiries; buyers sometimes append an emoji or other
+// text. Restrict it to current inbound messages on still-provisional GROUP_THREADs so an old
+// backlog or an established personal conversation cannot be reclassified.
+func (b *bot) classifyMarketplaceGreeting(msg *table.WrappedMessage) bool {
+	if msg.SenderId == b.userID ||
+		msg.TimestampMs < b.startTime.Add(-2*time.Minute).UnixMilli() ||
+		!strings.Contains(msg.Text, marketplaceAvailabilityGreeting) {
+		return false
+	}
+
+	b.threadTypesMu.Lock()
+	defer b.threadTypesMu.Unlock()
+	if b.threadTypes[msg.ThreadKey] != table.GROUP_THREAD || b.authoritativeThreadTypes[msg.ThreadKey] {
+		return false
+	}
+	b.threadTypes[msg.ThreadKey] = table.MARKETPLACE
+	b.authoritativeThreadTypes[msg.ThreadKey] = true
+	return true
+}
+
 // devTestSender reports whether, in --dev testing mode, msg comes from a contact whose
 // name contains "Brandon", or whose ID was explicitly allow-listed via --dev-contact -
 // lets personal test messages through without a marketplace listing.
@@ -955,8 +1065,21 @@ func (b *bot) devTestSender(senderId int64) bool {
 
 func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 	threadID := msg.ThreadKey
+	if !b.marketplaceThread(threadID) && b.classifyMarketplaceGreeting(msg) {
+		b.log.Info().Int64("tid", threadID).Msg("marking generic thread as marketplace from standard availability greeting")
+	}
 
 	if !b.marketplaceThread(threadID) && !(b.selfTest && b.devTestSender(msg.SenderId)) {
+		// LSVerifyThreadExists labels new Marketplace inquiries as GROUP_THREAD. When the
+		// Marketplace CTA is dropped, immediately rejecting that provisional type loses the
+		// inquiry forever. A current inbound text is enough reason to fetch the complete thread
+		// row; replies remain blocked until that fetch proves it is Marketplace.
+		if msg.Text != "" && msg.SenderId != b.userID &&
+			msg.TimestampMs >= b.startTime.Add(-2*time.Minute).UnixMilli() &&
+			b.threadNeedsClassification(threadID) {
+			b.armClassificationRecovery(threadID)
+			b.log.Info().Int64("tid", threadID).Msg("generic thread has inbound message, scheduling classification fetch")
+		}
 		b.threadTypesMu.RLock()
 		tt, known := b.threadTypes[threadID]
 		mapSize := len(b.threadTypes)
