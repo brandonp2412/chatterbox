@@ -11,7 +11,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -210,42 +212,66 @@ func main() {
 	}
 }
 
-func run() error {
-	selfTest := false
-	cfgPath := "config.yaml"
-	var testThread int64
-	devContactIDs := make(map[int64]bool)
+type cliOptions struct {
+	selfTest      bool
+	cfgPath       string
+	testThread    int64
+	devContactIDs map[int64]bool
+}
 
-	args := os.Args[1:]
+func parseArgs(args []string) (cliOptions, error) {
+	opts := cliOptions{
+		cfgPath:       "config.yaml",
+		devContactIDs: make(map[int64]bool),
+	}
+	configPathSet := false
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
 		case a == "--dev":
-			selfTest = true
+			opts.selfTest = true
 		case a == "--test":
 			i++
 			if i >= len(args) {
-				return fmt.Errorf("--test requires a thread ID")
+				return cliOptions{}, fmt.Errorf("--test requires a thread ID")
 			}
 			v, err := strconv.ParseInt(args[i], 10, 64)
-			if err != nil {
-				return fmt.Errorf("invalid thread ID %q: %w", args[i], err)
+			if err != nil || v <= 0 {
+				return cliOptions{}, fmt.Errorf("invalid thread ID %q: must be a positive integer", args[i])
 			}
-			testThread = v
+			opts.testThread = v
 		case a == "--dev-contact":
 			i++
 			if i >= len(args) {
-				return fmt.Errorf("--dev-contact requires a contact/sender ID")
+				return cliOptions{}, fmt.Errorf("--dev-contact requires a contact/sender ID")
 			}
 			v, err := strconv.ParseInt(args[i], 10, 64)
-			if err != nil {
-				return fmt.Errorf("invalid contact ID %q: %w", args[i], err)
+			if err != nil || v <= 0 {
+				return cliOptions{}, fmt.Errorf("invalid contact ID %q: must be a positive integer", args[i])
 			}
-			devContactIDs[v] = true
+			opts.devContactIDs[v] = true
+		case strings.HasPrefix(a, "-"):
+			return cliOptions{}, fmt.Errorf("unknown option %q", a)
 		default:
-			cfgPath = a
+			if configPathSet {
+				return cliOptions{}, fmt.Errorf("multiple config paths provided: %q and %q", opts.cfgPath, a)
+			}
+			opts.cfgPath = a
+			configPathSet = true
 		}
 	}
+	return opts, nil
+}
+
+func run() error {
+	opts, err := parseArgs(os.Args[1:])
+	if err != nil {
+		return err
+	}
+	selfTest := opts.selfTest
+	cfgPath := opts.cfgPath
+	testThread := opts.testThread
+	devContactIDs := opts.devContactIDs
 
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
@@ -307,11 +333,21 @@ func run() error {
 		return fmt.Errorf("missing required cookies: %v", missing)
 	}
 
+	clientSettings := exhttp.ClientSettings{}
+	if cfg.Proxy != "" {
+		clientSettings, err = clientSettings.WithProxy(cfg.Proxy)
+		if err != nil {
+			return fmt.Errorf("invalid proxy %q: %w", cfg.Proxy, err)
+		}
+	}
 	mc := messagix.NewClient(c, libLog, &messagix.Config{
-		ClientSettings: exhttp.ClientSettings{},
+		ClientSettings: clientSettings,
 	})
 
-	ctx := context.Background()
+	signalCtx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stopSignals()
+	ctx, cancel := context.WithCancel(signalCtx)
+	defer cancel()
 
 	var userInfo types.UserInfo
 	var initialTable *table.LSTable
@@ -354,7 +390,9 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("failed to register e2ee: %w", err)
 		}
-		dev.Save(ctx)
+		if err := dev.Save(ctx); err != nil {
+			return fmt.Errorf("failed to save e2ee device: %w", err)
+		}
 	}
 
 	waClient, err := mc.PrepareE2EEClient()
@@ -375,30 +413,44 @@ func run() error {
 	}
 	log.Info().Int("count", len(selfSentOtids)).Msg("loaded self-sent message ids")
 
+	userThreads, err := loadUserThreads(userThreadsFile)
+	if err != nil {
+		return fmt.Errorf("failed to load user-participated threads: %w", err)
+	}
+	log.Info().Int("count", len(userThreads)).Msg("loaded user-participated threads")
+
+	repliedRules, err := loadRepliedRules(repliedRulesFile)
+	if err != nil {
+		return fmt.Errorf("failed to load replied rules: %w", err)
+	}
+	log.Info().Int("count", len(repliedRules)).Msg("loaded replied-rule threads")
+
 	bot := &bot{
 		log:                      log,
 		client:                   mc,
 		waClient:                 waClient,
 		rules:                    cfg.Rules,
 		replyOnce:                cfg.ReplyOnce && !selfTest,
-		replied:                  make(map[int64]map[int]bool),
+		replied:                  repliedRules,
 		userID:                   userInfo.GetFBID(),
 		selfTest:                 selfTest,
 		startTime:                time.Now(),
-		userThreads:              make(map[int64]bool),
+		userThreads:              userThreads,
 		lastReplyAt:              make(map[int64]time.Time),
 		replyCooldown:            replyCooldown,
 		selfSentOtids:            selfSentOtids,
-		repliedMsgIDs:            make(map[string]bool),
+		repliedMsgIDs:            make(map[string]struct{}),
 		listings:                 make(map[int64]*listing),
 		threadTypes:              make(map[int64]table.ThreadType),
 		authoritativeThreadTypes: make(map[int64]bool),
 		contactNames:             make(map[int64]string),
 		devContacts:              devContactIDs,
 		deepseekKey:              deepseekKey,
-		httpClient:               &http.Client{Timeout: 30 * time.Second},
+		httpClient:               clientSettings.WithGlobalTimeout(30 * time.Second).Compile(),
 		awaitingContent:          make(map[int64]*awaitingContentState),
 		ctx:                      ctx,
+		cancel:                   cancel,
+		runErr:                   make(chan error, 1),
 		work:                     make(chan func(), 64),
 	}
 
@@ -410,8 +462,8 @@ func run() error {
 	go bot.workLoop()
 
 	go func() {
-		if err := mc.Connect(ctx); err != nil {
-			log.Fatal().Err(err).Msg("Failed to connect")
+		if err := mc.Connect(ctx); err != nil && ctx.Err() == nil {
+			bot.fail(fmt.Errorf("failed to connect messenger socket: %w", err))
 		}
 	}()
 
@@ -435,14 +487,18 @@ func run() error {
 	go func() {
 		ticker := time.NewTicker(reconnectInterval)
 		defer ticker.Stop()
-		for range ticker.C {
-			log.Debug().Msg("periodic proactive reconnect of messenger socket")
-			mc.ForceReconnect()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				log.Debug().Msg("periodic proactive reconnect of messenger socket")
+				mc.ForceReconnect()
+			}
 		}
 	}()
 
-	if testThread > 0 {
-		time.Sleep(2 * time.Second)
+	if testThread > 0 && sleepContext(ctx, 2*time.Second) {
 		log.Info().Int64("thread", testThread).Msg("injecting test message")
 		bot.enqueue(func() {
 			bot.processMessage(ctx, &table.WrappedMessage{
@@ -455,15 +511,22 @@ func run() error {
 		})
 	}
 
-	sc := make(chan os.Signal, 1)
-	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM)
-	<-sc
+	var runErr error
+	select {
+	case runErr = <-bot.runErr:
+		cancel()
+	case <-ctx.Done():
+		select {
+		case runErr = <-bot.runErr:
+		default:
+		}
+	}
 
 	log.Info().Msg("Shutting down...")
 	bot.saveConnState()
 	mc.Disconnect()
 	waClient.Disconnect()
-	return nil
+	return runErr
 }
 
 type listing struct {
@@ -480,15 +543,18 @@ type bot struct {
 	waClient  *whatsmeow.Client
 	rules     []rule
 	replyOnce bool
-	replied   map[int64]map[int]bool
+	replied   map[int64]map[string]bool
 	userID    int64
 	selfTest  bool
 
-	ctx  context.Context
-	work chan func()
+	ctx    context.Context
+	cancel context.CancelFunc
+	runErr chan error
+	work   chan func()
 
-	restartMu      sync.Mutex
-	restartBackoff time.Duration
+	restartMu         sync.Mutex
+	restartBackoff    time.Duration
+	restartInProgress bool
 
 	lastStateSave   time.Time
 	lastStateSaveMu sync.Mutex
@@ -506,8 +572,9 @@ type bot struct {
 	// "threadID:messageID"). Cooldown alone isn't enough: a socket reconnect can redeliver
 	// an already-answered message as part of its backlog resync, well after the cooldown
 	// on that thread has expired.
-	repliedMsgIDs   map[string]bool
-	repliedMsgIDsMu sync.Mutex
+	repliedMsgIDs     map[string]struct{}
+	repliedMsgIDOrder []string
+	repliedMsgIDsMu   sync.Mutex
 
 	listings    map[int64]*listing
 	listingsMu  sync.RWMutex
@@ -547,24 +614,91 @@ type awaitingContentState struct {
 
 const connStateFile = "conn_state.json"
 
+func (b *bot) context() context.Context {
+	if b.ctx != nil {
+		return b.ctx
+	}
+	return context.Background()
+}
+
+func (b *bot) fail(err error) {
+	if err == nil {
+		return
+	}
+	if b.runErr != nil {
+		select {
+		case b.runErr <- err:
+		default:
+		}
+	}
+	if b.cancel != nil {
+		b.cancel()
+	}
+}
+
 func (b *bot) enqueue(f func()) {
+	ctx := b.context()
 	select {
 	case b.work <- f:
+		return
+	case <-ctx.Done():
+		return
 	default:
-		b.log.Warn().Msg("work queue full, library event delivery is blocked until it drains")
-		b.work <- f
+	}
+	b.log.Warn().Msg("work queue full, library event delivery is blocked until it drains")
+	select {
+	case b.work <- f:
+	case <-ctx.Done():
 	}
 }
 
 func (b *bot) workLoop() {
-	for f := range b.work {
-		f()
+	ctx := b.context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case f := <-b.work:
+			func() {
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						b.log.Error().Err(fmt.Errorf("panic: %v", recovered)).Msg("worker task panicked")
+					}
+				}()
+				f()
+			}()
+		}
 	}
 }
 
-func (b *bot) saveConnState() {
-	b.lastStateSaveMu.Lock()
-	defer b.lastStateSaveMu.Unlock()
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
+func (b *bot) saveConnStateLocked() {
 	state, err := b.client.DumpState()
 	if err != nil {
 		b.log.Err(err).Msg("failed to dump connection state")
@@ -573,36 +707,65 @@ func (b *bot) saveConnState() {
 	if state == nil {
 		return
 	}
-	if err := os.WriteFile(connStateFile, state, 0600); err != nil {
+	if err := writeFileAtomic(connStateFile, state, 0600); err != nil {
 		b.log.Err(err).Msg("failed to persist connection state")
+		return
 	}
+	b.lastStateSave = time.Now()
+}
+
+func (b *bot) saveConnState() {
+	b.lastStateSaveMu.Lock()
+	defer b.lastStateSaveMu.Unlock()
+	b.saveConnStateLocked()
 }
 
 func (b *bot) maybeSaveConnState() {
 	b.lastStateSaveMu.Lock()
+	defer b.lastStateSaveMu.Unlock()
 	if time.Since(b.lastStateSave) < time.Minute {
-		b.lastStateSaveMu.Unlock()
 		return
 	}
-	b.lastStateSave = time.Now()
-	b.lastStateSaveMu.Unlock()
-	b.saveConnState()
+	b.saveConnStateLocked()
 }
 
 func (b *bot) restartMessenger() {
 	b.restartMu.Lock()
-	if b.restartBackoff == 0 {
-		b.restartBackoff = 5 * time.Second
-	} else if b.restartBackoff < 5*time.Minute {
-		b.restartBackoff *= 2
+	if b.restartInProgress {
+		b.restartMu.Unlock()
+		return
 	}
-	backoff := b.restartBackoff
+	b.restartInProgress = true
 	b.restartMu.Unlock()
-	b.log.Error().Dur("retry_in", backoff).Msg("restarting messenger connection")
-	time.Sleep(backoff)
-	if err := b.client.Connect(b.ctx); err != nil {
-		b.log.Err(err).Msg("failed to restart messenger connection, retrying")
-		go b.restartMessenger()
+	defer func() {
+		b.restartMu.Lock()
+		b.restartInProgress = false
+		b.restartMu.Unlock()
+	}()
+
+	ctx := b.context()
+	for ctx.Err() == nil {
+		b.restartMu.Lock()
+		if b.restartBackoff == 0 {
+			b.restartBackoff = 5 * time.Second
+		} else if b.restartBackoff < 5*time.Minute {
+			b.restartBackoff *= 2
+		}
+		backoff := b.restartBackoff
+		b.restartMu.Unlock()
+
+		b.log.Error().Dur("retry_in", backoff).Msg("restarting messenger connection")
+		if !sleepContext(ctx, backoff) {
+			return
+		}
+		if err := b.client.Connect(ctx); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			b.log.Err(err).Msg("failed to restart messenger connection, retrying")
+			continue
+		}
+		return
 	}
 }
 
@@ -722,7 +885,13 @@ const (
 func (b *bot) contentRecoveryLoop(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
 		var due []int64
 		now := time.Now()
 		b.awaitingContentMu.Lock()
@@ -740,7 +909,9 @@ func (b *bot) contentRecoveryLoop(ctx context.Context) {
 				continue
 			}
 			state.attempts++
-			giveUp := state.attempts >= contentRecoveryMaxAttempts
+			attempt := state.attempts
+			needsClassification := state.needsClassification
+			giveUp := attempt >= contentRecoveryMaxAttempts
 			if giveUp {
 				delete(b.awaitingContent, tid)
 			} else {
@@ -748,9 +919,9 @@ func (b *bot) contentRecoveryLoop(ctx context.Context) {
 			}
 			b.awaitingContentMu.Unlock()
 
-			b.recoverMissingMessages(ctx, tid, state.attempts, state.needsClassification)
+			b.recoverMissingMessages(ctx, tid, attempt, needsClassification)
 			if giveUp {
-				b.log.Error().Int64("tid", tid).Int("attempts", state.attempts).Msg("giving up recovering marketplace thread content after max attempts")
+				b.log.Error().Int64("tid", tid).Int("attempts", attempt).Msg("giving up recovering marketplace thread content after max attempts")
 			}
 		}
 	}
@@ -844,8 +1015,11 @@ func (b *bot) handleEvent(ctx context.Context, evt any) {
 			errors.Is(e.Err, messagix.CONNECTION_REFUSED_BAD_USERNAME_OR_PASSWORD) {
 			// Retrying rejected credentials reconnects in a zero-backoff loop, hammering Meta
 			// with doomed auth attempts. Nothing recovers without fresh cookies.
-			os.Remove(connStateFile)
-			b.log.Fatal().Err(e.Err).Msg("messenger credentials rejected by server, update cookies in config.yaml")
+			if err := os.Remove(connStateFile); err != nil && !os.IsNotExist(err) {
+				b.log.Warn().Err(err).Msg("failed to remove rejected cached connection state")
+			}
+			b.fail(fmt.Errorf("messenger credentials rejected by server, update cookies in config.yaml: %w", e.Err))
+			return
 		}
 		// messagix's own reconnect loop (in Client.Connect) gives up for good after this -
 		// it will never retry again on its own. We're the only thing that can bring the
@@ -867,6 +1041,10 @@ func (b *bot) handleEvent(ctx context.Context, evt any) {
 // since ExecuteTasks returns its response table directly rather than routing it through the event
 // handler.
 func (b *bot) processTable(ctx context.Context, tbl *table.LSTable) {
+	if tbl == nil {
+		b.log.Debug().Msg("ignoring nil table")
+		return
+	}
 	b.recordThreadTypes(tbl)
 
 	if len(tbl.LSVerifyContactRowExists) > 0 {
@@ -907,18 +1085,16 @@ func (b *bot) processTable(ctx context.Context, tbl *table.LSTable) {
 	isRecent := func(timestampMs int64) bool {
 		return timestampMs >= b.startTime.Add(-2*time.Minute).UnixMilli()
 	}
-	b.userThreadsMu.Lock()
 	for _, msg := range tbl.LSUpsertMessage {
 		if msg.SenderId == b.userID && isRecent(msg.TimestampMs) && !isSelfSent(msg.MessageId, msg.OfflineThreadingId) && !recentlySelfReplied(msg.ThreadKey) {
-			b.userThreads[msg.ThreadKey] = true
+			b.recordUserThread(msg.ThreadKey)
 		}
 	}
 	for _, msg := range tbl.LSInsertMessage {
 		if msg.SenderId == b.userID && isRecent(msg.TimestampMs) && !isSelfSent(msg.MessageId, msg.OfflineThreadingId) && !recentlySelfReplied(msg.ThreadKey) {
-			b.userThreads[msg.ThreadKey] = true
+			b.recordUserThread(msg.ThreadKey)
 		}
 	}
-	b.userThreadsMu.Unlock()
 
 	upsert, insert := tbl.WrapMessages()
 	count := len(insert)
@@ -931,15 +1107,15 @@ func (b *bot) processTable(ctx context.Context, tbl *table.LSTable) {
 
 	for _, msg := range insert {
 		b.processMessage(ctx, msg)
-		if count > 1 {
-			time.Sleep(500 * time.Millisecond)
+		if count > 1 && !sleepContext(ctx, 500*time.Millisecond) {
+			return
 		}
 	}
 	for _, group := range upsert {
 		for _, msg := range group.Messages {
 			b.processMessage(ctx, msg)
-			if count > 1 {
-				time.Sleep(500 * time.Millisecond)
+			if count > 1 && !sleepContext(ctx, 500*time.Millisecond) {
+				return
 			}
 		}
 	}
@@ -997,11 +1173,14 @@ func (b *bot) buildPrompt(threadID int64) string {
 	)
 }
 
+const maxRepliedMessageIDs = 10000
+
 // alreadyReplied reports whether key (a "threadID:messageID" pair) has already been replied to.
 func (b *bot) alreadyReplied(key string) bool {
 	b.repliedMsgIDsMu.Lock()
 	defer b.repliedMsgIDsMu.Unlock()
-	return b.repliedMsgIDs[key]
+	_, ok := b.repliedMsgIDs[key]
+	return ok
 }
 
 func (b *bot) markReplied(key string) {
@@ -1009,8 +1188,18 @@ func (b *bot) markReplied(key string) {
 		return
 	}
 	b.repliedMsgIDsMu.Lock()
-	b.repliedMsgIDs[key] = true
-	b.repliedMsgIDsMu.Unlock()
+	defer b.repliedMsgIDsMu.Unlock()
+	if _, exists := b.repliedMsgIDs[key]; exists {
+		return
+	}
+	b.repliedMsgIDs[key] = struct{}{}
+	b.repliedMsgIDOrder = append(b.repliedMsgIDOrder, key)
+	if len(b.repliedMsgIDOrder) <= maxRepliedMessageIDs {
+		return
+	}
+	oldest := b.repliedMsgIDOrder[0]
+	b.repliedMsgIDOrder = b.repliedMsgIDOrder[1:]
+	delete(b.repliedMsgIDs, oldest)
 }
 
 func (b *bot) marketplaceThread(threadKey int64) bool {
@@ -1100,13 +1289,14 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 
 	// Some mc/legacy redelivery routes (backlog resyncs in particular) come through with an
 	// empty MessageId, which used to bypass this dedup entirely and caused the same message to
-	// get replied to again once the cooldown had cleared. Fall back to a sender+text key so a
-	// blank ID doesn't defeat the check - this can only ever falsely suppress a genuine,
-	// deliberate resend of the exact same text in the same thread, which is far rarer than the
-	// duplicate-delivery case it fixes.
+	// get replied to again once the cooldown had cleared. Fall back to sender+timestamp+text:
+	// redelivery preserves the original timestamp, while a genuine repeat later remains distinct.
 	msgKey := fmt.Sprintf("%d:%s", threadID, msg.MessageId)
 	if msg.MessageId == "" {
-		msgKey = fmt.Sprintf("%d:%d:%s", threadID, msg.SenderId, msg.Text)
+		// A redelivery keeps the original timestamp, while a genuine repeat of identical text
+		// later has a different one. Including it avoids suppressing legitimate repeat messages
+		// forever just because this delivery path omitted MessageId.
+		msgKey = fmt.Sprintf("%d:%d:%d:%s", threadID, msg.SenderId, msg.TimestampMs, msg.Text)
 	}
 	if b.alreadyReplied(msgKey) {
 		b.log.Info().Int64("tid", threadID).Str("message_id", msg.MessageId).Msg("skipping already-replied message")
@@ -1150,9 +1340,7 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 			(msg.OfflineThreadingId != "" && b.selfSentOtids[msg.OfflineThreadingId])
 		b.selfSentMu.Unlock()
 		if !selfSent {
-			b.userThreadsMu.Lock()
-			b.userThreads[threadID] = true
-			b.userThreadsMu.Unlock()
+			b.recordUserThread(threadID)
 		}
 		return
 	}
@@ -1176,7 +1364,7 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 	b.markThreadRead(ctx, threadID, msg.TimestampMs)
 
 	if b.deepseekKey != "" {
-		reply, err := b.callDeepseek(b.buildPrompt(threadID), text)
+		reply, err := b.callDeepseek(ctx, b.buildPrompt(threadID), text)
 		if err != nil {
 			b.log.Err(err).Msg("deepseek call failed, falling back to rules")
 		} else if reply != "" {
@@ -1191,20 +1379,10 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 		}
 	}
 
-	for i, rule := range b.rules {
+	for _, rule := range b.rules {
 		if rule.compiled.MatchString(text) {
-			if b.replyOnce {
-				b.repliedMu.Lock()
-				rset, ok := b.replied[threadID]
-				if !ok {
-					rset = make(map[int]bool)
-					b.replied[threadID] = rset
-				}
-				seen := rset[i]
-				b.repliedMu.Unlock()
-				if seen {
-					continue
-				}
+			if b.replyOnce && b.ruleAlreadyReplied(threadID, rule.Pattern) {
+				continue
 			}
 
 			b.log.Debug().
@@ -1216,10 +1394,10 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 			// sent - marking it beforehand meant a failed send (e.g. a reconnect racing the
 			// send) would permanently mark the message as handled despite never answering it.
 			if b.sendReply(ctx, threadID, rule.Reply) {
-				b.repliedMu.Lock()
 				if b.replyOnce {
-					b.replied[threadID][i] = true
+					b.recordRuleReply(threadID, rule.Pattern)
 				}
+				b.repliedMu.Lock()
 				b.lastReplyAt[threadID] = time.Now()
 				b.repliedMu.Unlock()
 				b.markReplied(msgKey)
@@ -1236,8 +1414,9 @@ type deepseekMessage struct {
 }
 
 type deepseekRequest struct {
-	Model    string            `json:"model"`
-	Messages []deepseekMessage `json:"messages"`
+	Model     string            `json:"model"`
+	Messages  []deepseekMessage `json:"messages"`
+	MaxTokens int               `json:"max_tokens,omitempty"`
 }
 
 type deepseekChoice struct {
@@ -1248,9 +1427,12 @@ type deepseekResponse struct {
 	Choices []deepseekChoice `json:"choices"`
 }
 
-func (b *bot) callDeepseek(systemPrompt, userMessage string) (string, error) {
+const deepseekMaxResponseBytes = 1 << 20
+
+func (b *bot) callDeepseek(ctx context.Context, systemPrompt, userMessage string) (string, error) {
 	reqBody := deepseekRequest{
-		Model: "deepseek-chat",
+		Model:     "deepseek-chat",
+		MaxTokens: 120,
 		Messages: []deepseekMessage{
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userMessage},
@@ -1261,7 +1443,7 @@ func (b *bot) callDeepseek(systemPrompt, userMessage string) (string, error) {
 		return "", err
 	}
 
-	req, err := http.NewRequest("POST", "https://api.deepseek.com/v1/chat/completions", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.deepseek.com/v1/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
@@ -1274,9 +1456,12 @@ func (b *bot) callDeepseek(systemPrompt, userMessage string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, deepseekMaxResponseBytes+1))
 	if err != nil {
 		return "", err
+	}
+	if len(respBody) > deepseekMaxResponseBytes {
+		return "", fmt.Errorf("deepseek response exceeded %d bytes", deepseekMaxResponseBytes)
 	}
 
 	if resp.StatusCode != 200 {
@@ -1298,7 +1483,11 @@ func (b *bot) callDeepseek(systemPrompt, userMessage string) (string, error) {
 	return strings.TrimSpace(ds.Choices[0].Message.Content), nil
 }
 
-const selfSentIDsFile = "self_sent_ids.txt"
+const (
+	selfSentIDsFile  = "self_sent_ids.txt"
+	userThreadsFile  = "user_threads.txt"
+	repliedRulesFile = "replied_rules.json"
+)
 
 // recordSelfSent marks id as one of our own sent messages, both in memory and durably on disk.
 // Persistence matters because a restart's initial backlog resync replays our own historical
@@ -1345,6 +1534,109 @@ func loadSelfSentIDs(path string) (map[string]bool, error) {
 	return ids, nil
 }
 
+func loadUserThreads(path string) (map[int64]bool, error) {
+	threads := make(map[int64]bool)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return threads, nil
+		}
+		return nil, err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		threadID, err := strconv.ParseInt(line, 10, 64)
+		if err != nil || threadID <= 0 {
+			return nil, fmt.Errorf("invalid persisted thread ID %q", line)
+		}
+		threads[threadID] = true
+	}
+	return threads, nil
+}
+
+func (b *bot) recordUserThread(threadID int64) {
+	if threadID <= 0 {
+		return
+	}
+	b.userThreadsMu.Lock()
+	defer b.userThreadsMu.Unlock()
+	if b.userThreads == nil {
+		b.userThreads = make(map[int64]bool)
+	}
+	if b.userThreads[threadID] {
+		return
+	}
+	b.userThreads[threadID] = true
+
+	ids := make([]int64, 0, len(b.userThreads))
+	for id := range b.userThreads {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	var persisted strings.Builder
+	for _, id := range ids {
+		fmt.Fprintf(&persisted, "%d\n", id)
+	}
+	if err := writeFileAtomic(userThreadsFile, []byte(persisted.String()), 0600); err != nil {
+		b.log.Err(err).Int64("tid", threadID).Msg("failed to persist user-participated thread")
+	}
+}
+
+func loadRepliedRules(path string) (map[int64]map[string]bool, error) {
+	replied := make(map[int64]map[string]bool)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return replied, nil
+		}
+		return nil, err
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		return replied, nil
+	}
+	if err := json.Unmarshal(data, &replied); err != nil {
+		return nil, fmt.Errorf("failed to parse persisted replied rules: %w", err)
+	}
+	return replied, nil
+}
+
+func (b *bot) ruleAlreadyReplied(threadID int64, pattern string) bool {
+	b.repliedMu.Lock()
+	defer b.repliedMu.Unlock()
+	return b.replied[threadID][pattern]
+}
+
+func (b *bot) recordRuleReply(threadID int64, pattern string) {
+	if threadID <= 0 || pattern == "" {
+		return
+	}
+	b.repliedMu.Lock()
+	defer b.repliedMu.Unlock()
+	if b.replied == nil {
+		b.replied = make(map[int64]map[string]bool)
+	}
+	rules := b.replied[threadID]
+	if rules == nil {
+		rules = make(map[string]bool)
+		b.replied[threadID] = rules
+	}
+	if rules[pattern] {
+		return
+	}
+	rules[pattern] = true
+	data, err := json.Marshal(b.replied)
+	if err != nil {
+		b.log.Err(err).Int64("tid", threadID).Msg("failed to encode replied-rule state")
+		return
+	}
+	if err := writeFileAtomic(repliedRulesFile, data, 0600); err != nil {
+		b.log.Err(err).Int64("tid", threadID).Msg("failed to persist replied-rule state")
+	}
+}
+
 const markReadMaxAttempts = 3
 
 func (b *bot) markThreadRead(ctx context.Context, threadID int64, watermarkMs int64) {
@@ -1365,8 +1657,8 @@ func (b *bot) markThreadRead(ctx context.Context, threadID int64, watermarkMs in
 		} else {
 			b.log.Warn().Int64("tid", threadID).Int("attempt", attempt).Msg("mark thread read not confirmed by server, retrying")
 		}
-		if attempt < markReadMaxAttempts {
-			time.Sleep(time.Duration(attempt) * time.Second)
+		if attempt < markReadMaxAttempts && !sleepContext(ctx, time.Duration(attempt)*time.Second) {
+			return
 		}
 	}
 	b.log.Error().Int64("tid", threadID).Msg("giving up marking thread read after retries")
@@ -1384,21 +1676,34 @@ func threadReadConfirmed(resp *table.LSTable, threadID int64) bool {
 	return false
 }
 
+func sleepContext(ctx context.Context, d time.Duration) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 // humanReplyDelay sleeps a randomized interval before sending, so replies read as a quick but
 // normal human response time rather than an instant bot reply.
-func humanReplyDelay(ctx context.Context) {
+func humanReplyDelay(ctx context.Context) bool {
 	d := 3*time.Second + time.Duration(rand.Int63n(int64(5*time.Second)))
-	select {
-	case <-time.After(d):
-	case <-ctx.Done():
-	}
+	return sleepContext(ctx, d)
 }
 
 // sendReply returns whether the message actually sent. Callers must only record the reply
 // (cooldown, dedup, replied-once) when this returns true, so a failed send can be retried
 // instead of being permanently treated as handled.
 func (b *bot) sendReply(ctx context.Context, threadID int64, text string) bool {
-	humanReplyDelay(ctx)
+	if !humanReplyDelay(ctx) {
+		return false
+	}
 	otid := methods.GenerateEpochID()
 	task := &socket.SendMessageTask{
 		ThreadId:         threadID,
@@ -1475,7 +1780,7 @@ func (b *bot) e2eeHandler(evt any) {
 		// "inactive" (the same signal WhatsApp Web sends when backgrounded), which is exactly
 		// the kind of state Meta can use to quietly stop pushing new messages down an
 		// otherwise-healthy, keepalive-passing socket.
-		if err := b.waClient.SendPresence(context.Background(), waTypes.PresenceAvailable); err != nil {
+		if err := b.waClient.SendPresence(b.context(), waTypes.PresenceAvailable); err != nil {
 			b.log.Err(err).Msg("failed to send e2ee presence")
 		}
 	case *waEvents.LoggedOut:
@@ -1562,9 +1867,7 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 			return
 		}
 		b.log.Info().Int64("tid", tid).Msg("e2ee: message from self, marking userThreads")
-		b.userThreadsMu.Lock()
-		b.userThreads[tid] = true
-		b.userThreadsMu.Unlock()
+		b.recordUserThread(tid)
 		return
 	}
 
@@ -1623,7 +1926,7 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 	}
 
 	if b.deepseekKey != "" {
-		reply, err := b.callDeepseek(b.buildPrompt(tid), text)
+		reply, err := b.callDeepseek(b.context(), b.buildPrompt(tid), text)
 		if err != nil {
 			b.log.Err(err).Msg("deepseek call failed (e2ee), falling back to rules")
 		} else if reply != "" {
@@ -1638,20 +1941,10 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 		}
 	}
 
-	for i, rule := range b.rules {
+	for _, rule := range b.rules {
 		if rule.compiled.MatchString(text) {
-			if b.replyOnce {
-				b.repliedMu.Lock()
-				rset, ok := b.replied[tid]
-				if !ok {
-					rset = make(map[int]bool)
-					b.replied[tid] = rset
-				}
-				seen := rset[i]
-				b.repliedMu.Unlock()
-				if seen {
-					continue
-				}
+			if b.replyOnce && b.ruleAlreadyReplied(tid, rule.Pattern) {
+				continue
 			}
 
 			b.log.Debug().
@@ -1660,10 +1953,10 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 				Msg("auto-replying (e2ee)")
 
 			if b.sendE2EEReply(fbMsg.Info, tid, rule.Reply) {
-				b.repliedMu.Lock()
 				if b.replyOnce {
-					b.replied[tid][i] = true
+					b.recordRuleReply(tid, rule.Pattern)
 				}
+				b.repliedMu.Lock()
 				b.lastReplyAt[tid] = time.Now()
 				b.repliedMu.Unlock()
 				b.markReplied(msgKey)
@@ -1682,7 +1975,10 @@ func (b *bot) sendE2EEReply(srcInfo waTypes.MessageInfo, threadID int64, text st
 		b.log.Warn().Msg("no e2ee client, cannot reply")
 		return false
 	}
-	humanReplyDelay(context.Background())
+	ctx := b.context()
+	if !humanReplyDelay(ctx) {
+		return false
+	}
 	msg := &waConsumer.ConsumerApplication{
 		Payload: &waConsumer.ConsumerApplication_Payload{
 			Payload: &waConsumer.ConsumerApplication_Payload_Content{
@@ -1703,17 +1999,21 @@ func (b *bot) sendE2EEReply(srcInfo waTypes.MessageInfo, threadID int64, text st
 	for attempt := range 5 {
 		if !b.waClient.IsConnected() {
 			b.log.Warn().Msg("e2ee socket not connected, waiting before retry")
-			time.Sleep(3 * time.Second)
+			if !sleepContext(ctx, 3*time.Second) {
+				return false
+			}
 			continue
 		}
 		var err error
-		resp, err = b.waClient.SendFBMessage(context.Background(), srcInfo.Chat, msg, nil, whatsmeow.SendRequestExtra{ID: waTypes.MessageID(otidStr)})
+		resp, err = b.waClient.SendFBMessage(ctx, srcInfo.Chat, msg, nil, whatsmeow.SendRequestExtra{ID: waTypes.MessageID(otidStr)})
 		if err == nil {
 			sent = true
 			break
 		}
 		b.log.Err(err).Msg("failed to send e2ee reply, retrying")
-		time.Sleep(time.Duration(attempt+1) * time.Second)
+		if !sleepContext(ctx, time.Duration(attempt+1)*time.Second) {
+			return false
+		}
 	}
 	if !sent {
 		b.log.Error().Msg("Failed to send e2ee reply")
@@ -1730,7 +2030,7 @@ func (b *bot) markE2EEThreadRead(threadID int64, srcInfo waTypes.MessageInfo) {
 	if b.waClient == nil {
 		return
 	}
-	if err := b.waClient.MarkRead(context.Background(), []waTypes.MessageID{srcInfo.ID}, time.Now(), srcInfo.Chat, srcInfo.Sender); err != nil {
+	if err := b.waClient.MarkRead(b.context(), []waTypes.MessageID{srcInfo.ID}, time.Now(), srcInfo.Chat, srcInfo.Sender); err != nil {
 		b.log.Err(err).Int64("tid", threadID).Msg("failed to mark e2ee thread read")
 	}
 }
@@ -1740,9 +2040,11 @@ func loadConfig(path string) (*config, error) {
 	if err != nil {
 		if os.IsNotExist(err) {
 			cfg := &config{
-				Mode:      "facebook",
-				LogLevel:  "info",
-				ReplyOnce: true,
+				Mode:                     "facebook",
+				LogLevel:                 "info",
+				ReplyOnce:                true,
+				ReplyCooldownMinutes:     5,
+				ReconnectIntervalMinutes: 360,
 				Cookies: map[string]string{
 					"xs":     "",
 					"c_user": "",
@@ -1750,22 +2052,57 @@ func loadConfig(path string) (*config, error) {
 				},
 				Rules: defaultRules,
 			}
-			out, _ := yaml.Marshal(cfg)
-			if err := os.WriteFile(path, out, 0600); err != nil {
+			out, marshalErr := yaml.Marshal(cfg)
+			if marshalErr != nil {
+				return nil, fmt.Errorf("failed to encode default config: %w", marshalErr)
+			}
+			if err := writeFileAtomic(path, out, 0600); err != nil {
 				return nil, fmt.Errorf("failed to write default config: %w", err)
 			}
 			return nil, fmt.Errorf("config file created at %s, please edit it and run again", path)
 		}
 		return nil, err
 	}
+	if info, statErr := os.Stat(path); statErr != nil {
+		return nil, fmt.Errorf("failed to inspect config permissions: %w", statErr)
+	} else if info.Mode().Perm()&0077 != 0 {
+		if chmodErr := os.Chmod(path, 0600); chmodErr != nil {
+			return nil, fmt.Errorf("config contains credentials but permissions could not be tightened to 0600: %w", chmodErr)
+		}
+	}
 
-	var cfg config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	cfg := config{
+		Mode:                     "facebook",
+		LogLevel:                 "info",
+		ReplyOnce:                true,
+		ReplyCooldownMinutes:     5,
+		ReconnectIntervalMinutes: 360,
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
 
-	if len(cfg.Rules) == 0 {
-		return nil, fmt.Errorf("no reply rules configured")
+	if _, err := zerolog.ParseLevel(cfg.LogLevel); err != nil {
+		return nil, fmt.Errorf("invalid log_level %q: %w", cfg.LogLevel, err)
+	}
+	if cfg.ReplyCooldownMinutes < 0 {
+		return nil, fmt.Errorf("reply_cooldown_minutes must not be negative")
+	}
+	if cfg.ReconnectIntervalMinutes < 0 {
+		return nil, fmt.Errorf("reconnect_interval_minutes must not be negative")
+	}
+	for i, rule := range cfg.Rules {
+		if strings.TrimSpace(rule.Pattern) == "" {
+			return nil, fmt.Errorf("rule %d has an empty pattern", i+1)
+		}
+		if strings.TrimSpace(rule.Reply) == "" {
+			return nil, fmt.Errorf("rule %d has an empty reply", i+1)
+		}
+	}
+	if len(cfg.Rules) == 0 && cfg.DeepseekKey == "" {
+		return nil, fmt.Errorf("no reply rules configured and deepseek_key is empty")
 	}
 
 	return &cfg, nil

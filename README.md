@@ -6,7 +6,7 @@ Auto-reply bot for Facebook Marketplace messages.
 
 ### Prerequisites
 
-- Go 1.23+
+- Go 1.26.5+
 - Facebook account with access to Marketplace messages
 
 ### 1. Get your Facebook cookies
@@ -22,9 +22,11 @@ Open DevTools → Application → Cookies, and copy the values for:
 
 ```bash
 cp config.example.yaml config.yaml
+chmod 600 config.yaml
 ```
 
-Edit `config.yaml` with your cookies and custom reply rules.
+Edit `config.yaml` with your cookies and custom reply rules. Chatterbox also tightens the file to
+`0600` on startup if it is more permissive.
 
 ### 3. Build and run
 
@@ -53,6 +55,15 @@ If your config file is elsewhere:
 mode: "facebook"      # facebook.com cookies
 # mode: "messenger"   # messenger.com cookies
 # mode: "messenger-lite"  # Messenger Lite API (mobile-style)
+```
+
+### Proxy
+
+Set `proxy` to route Meta and DeepSeek HTTP traffic through an HTTP(S) proxy. Leave it blank for
+direct connections.
+
+```yaml
+proxy: "http://127.0.0.1:8080"
 ```
 
 ### Rules

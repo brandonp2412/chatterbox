@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -257,5 +260,172 @@ func TestLogFilterRedactsNestedDependencyData(t *testing.T) {
 	}
 	if !strings.Contains(got, `"state":"failed"`) {
 		t.Errorf("nested dependency log lost non-PII context: %s", got)
+	}
+}
+
+func TestParseArgs(t *testing.T) {
+	opts, err := parseArgs([]string{"--dev", "--test", "123", "--dev-contact", "456", "custom.yaml"})
+	if err != nil {
+		t.Fatalf("parseArgs() error = %v", err)
+	}
+	if !opts.selfTest || opts.testThread != 123 || opts.cfgPath != "custom.yaml" || !opts.devContactIDs[456] {
+		t.Fatalf("unexpected parsed options: %+v", opts)
+	}
+
+	for _, args := range [][]string{
+		{"--unknown"},
+		{"--test", "0"},
+		{"--test", "nope"},
+		{"--dev-contact", "-4"},
+		{"one.yaml", "two.yaml"},
+	} {
+		if _, err := parseArgs(args); err == nil {
+			t.Errorf("parseArgs(%q) unexpectedly succeeded", args)
+		}
+	}
+}
+
+func TestLoadConfigAppliesDefaultsAndTightensPermissions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	contents := "rules:\n  - pattern: hello\n    reply: hi\n"
+	if err := os.WriteFile(path, []byte(contents), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig() error = %v", err)
+	}
+	if cfg.Mode != "facebook" || cfg.LogLevel != "info" || !cfg.ReplyOnce || cfg.ReplyCooldownMinutes != 5 || cfg.ReconnectIntervalMinutes != 360 {
+		t.Fatalf("documented defaults not applied: %+v", cfg)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0600 {
+		t.Fatalf("config permissions = %o, want 600", got)
+	}
+}
+
+func TestLoadConfigRejectsUnknownFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	contents := "rules:\n  - pattern: hello\n    reply: hi\nreply_onse: true\n"
+	if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadConfig(path); err == nil {
+		t.Fatal("loadConfig() accepted an unknown config field")
+	}
+}
+
+func TestLoadConfigAllowsDeepseekOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("deepseek_key: test-key\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig() error = %v", err)
+	}
+	if cfg.DeepseekKey != "test-key" || len(cfg.Rules) != 0 {
+		t.Fatalf("unexpected DeepSeek-only config: %+v", cfg)
+	}
+}
+
+func TestLoadConfigRejectsInvalidValues(t *testing.T) {
+	for name, contents := range map[string]string{
+		"bad log level":      "deepseek_key: x\nlog_level: noisy\n",
+		"negative cooldown":  "deepseek_key: x\nreply_cooldown_minutes: -1\n",
+		"negative reconnect": "deepseek_key: x\nreconnect_interval_minutes: -1\n",
+		"empty pattern":      "rules:\n  - pattern: ''\n    reply: hi\n",
+		"empty reply":        "rules:\n  - pattern: hello\n    reply: ''\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := loadConfig(path); err == nil {
+				t.Fatal("loadConfig() unexpectedly accepted invalid configuration")
+			}
+		})
+	}
+}
+
+func TestRepliedMessageDedupIsBounded(t *testing.T) {
+	b := &bot{repliedMsgIDs: make(map[string]struct{})}
+	for i := 0; i < maxRepliedMessageIDs+25; i++ {
+		b.markReplied(fmt.Sprintf("message-%d", i))
+	}
+	if got := len(b.repliedMsgIDs); got != maxRepliedMessageIDs {
+		t.Fatalf("dedup cache size = %d, want %d", got, maxRepliedMessageIDs)
+	}
+	if b.alreadyReplied("message-0") {
+		t.Fatal("oldest dedup entry was not evicted")
+	}
+	if !b.alreadyReplied(fmt.Sprintf("message-%d", maxRepliedMessageIDs+24)) {
+		t.Fatal("newest dedup entry was unexpectedly missing")
+	}
+}
+
+func TestProcessTableHandlesNil(t *testing.T) {
+	b := &bot{log: zerolog.Nop()}
+	b.processTable(context.Background(), nil)
+}
+
+func TestSleepContextCancelsImmediately(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if sleepContext(ctx, time.Hour) {
+		t.Fatal("sleepContext reported completion after cancellation")
+	}
+}
+
+func TestWorkLoopRecoversTaskPanic(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b := &bot{
+		log:  zerolog.Nop(),
+		ctx:  ctx,
+		work: make(chan func(), 2),
+	}
+	done := make(chan struct{})
+	go b.workLoop()
+	b.enqueue(func() { panic("test panic") })
+	b.enqueue(func() { close(done) })
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("worker stopped after a task panic")
+	}
+}
+
+func TestLoadUserThreads(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "user_threads.txt")
+	if err := os.WriteFile(path, []byte("42\n7\n42\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	threads, err := loadUserThreads(path)
+	if err != nil {
+		t.Fatalf("loadUserThreads() error = %v", err)
+	}
+	if len(threads) != 2 || !threads[42] || !threads[7] {
+		t.Fatalf("unexpected persisted thread set: %v", threads)
+	}
+}
+
+func TestLoadRepliedRules(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "replied_rules.json")
+	if err := os.WriteFile(path, []byte(`{"42":{"(?i)hello":true}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	replied, err := loadRepliedRules(path)
+	if err != nil {
+		t.Fatalf("loadRepliedRules() error = %v", err)
+	}
+	if !replied[42]["(?i)hello"] {
+		t.Fatalf("persisted rule state not restored: %v", replied)
 	}
 }

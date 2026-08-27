@@ -5,3 +5,7 @@ vendor/
 .env
 device.db
 conn_state.json
+self_sent_ids.txt
+user_threads.txt
+replied_rules.json
+device.db-*
