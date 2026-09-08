@@ -2039,35 +2039,38 @@ func (b *bot) markE2EEThreadRead(threadID int64, srcInfo waTypes.MessageInfo) {
 
 func loadConfig(path string) (*config, error) {
 	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			cfg := &config{
-				Mode:                     "facebook",
-				LogLevel:                 "info",
-				ReplyOnce:                true,
-				ReplyCooldownMinutes:     5,
-				ReconnectIntervalMinutes: 360,
-				Cookies: map[string]string{
-					"xs":     "",
-					"c_user": "",
-					"datr":   "",
-				},
-				Rules: defaultRules,
-			}
-			out, marshalErr := yaml.Marshal(cfg)
-			if marshalErr != nil {
-				return nil, fmt.Errorf("failed to encode default config: %w", marshalErr)
-			}
-			if err := writeFileAtomic(path, out, 0600); err != nil {
-				return nil, fmt.Errorf("failed to write default config: %w", err)
-			}
-			return nil, fmt.Errorf("config file created at %s, please edit it and run again", path)
+	if os.IsNotExist(err) {
+		cfg := &config{
+			Mode:                     "facebook",
+			LogLevel:                 "info",
+			ReplyOnce:                true,
+			ReplyCooldownMinutes:     5,
+			ReconnectIntervalMinutes: 360,
+			Cookies: map[string]string{
+				"xs":     "",
+				"c_user": "",
+				"datr":   "",
+			},
+			Rules: defaultRules,
 		}
+		out, marshalErr := yaml.Marshal(cfg)
+		if marshalErr != nil {
+			return nil, fmt.Errorf("failed to encode default config: %w", marshalErr)
+		}
+		if err := writeFileAtomic(path, out, 0600); err != nil {
+			return nil, fmt.Errorf("failed to write default config: %w", err)
+		}
+		return nil, fmt.Errorf("config file created at %s, please edit it and run again", path)
+	}
+	if err != nil {
 		return nil, err
 	}
-	if info, statErr := os.Stat(path); statErr != nil {
+
+	info, statErr := os.Stat(path)
+	if statErr != nil {
 		return nil, fmt.Errorf("failed to inspect config permissions: %w", statErr)
-	} else if info.Mode().Perm()&0077 != 0 {
+	}
+	if info.Mode().Perm()&0077 != 0 {
 		if chmodErr := os.Chmod(path, 0600); chmodErr != nil {
 			return nil, fmt.Errorf("config contains credentials but permissions could not be tightened to 0600: %w", chmodErr)
 		}
