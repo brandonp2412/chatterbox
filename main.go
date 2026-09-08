@@ -1380,30 +1380,31 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 	}
 
 	for _, rule := range b.rules {
-		if rule.compiled.MatchString(text) {
-			if b.replyOnce && b.ruleAlreadyReplied(threadID, rule.Pattern) {
-				continue
-			}
-
-			b.log.Debug().
-				Int64("thread", threadID).
-				Str("pattern", rule.Pattern).
-				Msg("auto-replying")
-
-			// Only record the reply (cooldown, replied-once, message-dedup) once it's actually
-			// sent - marking it beforehand meant a failed send (e.g. a reconnect racing the
-			// send) would permanently mark the message as handled despite never answering it.
-			if b.sendReply(ctx, threadID, rule.Reply) {
-				if b.replyOnce {
-					b.recordRuleReply(threadID, rule.Pattern)
-				}
-				b.repliedMu.Lock()
-				b.lastReplyAt[threadID] = time.Now()
-				b.repliedMu.Unlock()
-				b.markReplied(msgKey)
-			}
-			return
+		if !rule.compiled.MatchString(text) {
+			continue
 		}
+		if b.replyOnce && b.ruleAlreadyReplied(threadID, rule.Pattern) {
+			continue
+		}
+
+		b.log.Debug().
+			Int64("thread", threadID).
+			Str("pattern", rule.Pattern).
+			Msg("auto-replying")
+
+		// Only record the reply (cooldown, replied-once, message-dedup) once it's actually
+		// sent - marking it beforehand meant a failed send (e.g. a reconnect racing the
+		// send) would permanently mark the message as handled despite never answering it.
+		if b.sendReply(ctx, threadID, rule.Reply) {
+			if b.replyOnce {
+				b.recordRuleReply(threadID, rule.Pattern)
+			}
+			b.repliedMu.Lock()
+			b.lastReplyAt[threadID] = time.Now()
+			b.repliedMu.Unlock()
+			b.markReplied(msgKey)
+		}
+		return
 	}
 	b.log.Info().Int64("tid", threadID).Str("text", text).Msg("no rule matched")
 }
@@ -1942,27 +1943,28 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 	}
 
 	for _, rule := range b.rules {
-		if rule.compiled.MatchString(text) {
-			if b.replyOnce && b.ruleAlreadyReplied(tid, rule.Pattern) {
-				continue
-			}
-
-			b.log.Debug().
-				Int64("thread", tid).
-				Str("pattern", rule.Pattern).
-				Msg("auto-replying (e2ee)")
-
-			if b.sendE2EEReply(fbMsg.Info, tid, rule.Reply) {
-				if b.replyOnce {
-					b.recordRuleReply(tid, rule.Pattern)
-				}
-				b.repliedMu.Lock()
-				b.lastReplyAt[tid] = time.Now()
-				b.repliedMu.Unlock()
-				b.markReplied(msgKey)
-			}
-			return
+		if !rule.compiled.MatchString(text) {
+			continue
 		}
+		if b.replyOnce && b.ruleAlreadyReplied(tid, rule.Pattern) {
+			continue
+		}
+
+		b.log.Debug().
+			Int64("thread", tid).
+			Str("pattern", rule.Pattern).
+			Msg("auto-replying (e2ee)")
+
+		if b.sendE2EEReply(fbMsg.Info, tid, rule.Reply) {
+			if b.replyOnce {
+				b.recordRuleReply(tid, rule.Pattern)
+			}
+			b.repliedMu.Lock()
+			b.lastReplyAt[tid] = time.Now()
+			b.repliedMu.Unlock()
+			b.markReplied(msgKey)
+		}
+		return
 	}
 	b.log.Info().Int64("tid", tid).Str("text", text).Msg("e2ee no rule matched")
 }
