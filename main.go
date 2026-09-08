@@ -953,23 +953,24 @@ func (b *bot) recoverMissingMessages(ctx context.Context, threadKey int64, attem
 		b.log.Err(err).Int64("tid", threadKey).Msg("failed to fetch thread for content recovery")
 		return
 	}
-	if resp != nil {
-		if needsClassification {
-			if responseClassifiesMarketplace(resp, threadKey) {
-				b.awaitingContentMu.Lock()
-				if state := b.awaitingContent[threadKey]; state != nil {
-					state.needsClassification = false
-				}
-				b.awaitingContentMu.Unlock()
-			} else if responseConfirmsNonMarketplace(resp, threadKey) {
-				// The full row confirms this really is a normal Messenger thread. Stop the
-				// recovery without ever feeding it to the auto-reply rules.
-				b.clearContentRecovery(threadKey)
-				b.log.Info().Int64("tid", threadKey).Msg("confirmed non-marketplace thread")
-			}
-		}
-		b.enqueue(func() { b.processTable(b.ctx, resp) })
+	if resp == nil {
+		return
 	}
+	if needsClassification {
+		if responseClassifiesMarketplace(resp, threadKey) {
+			b.awaitingContentMu.Lock()
+			if state := b.awaitingContent[threadKey]; state != nil {
+				state.needsClassification = false
+			}
+			b.awaitingContentMu.Unlock()
+		} else if responseConfirmsNonMarketplace(resp, threadKey) {
+			// The full row confirms this really is a normal Messenger thread. Stop the
+			// recovery without ever feeding it to the auto-reply rules.
+			b.clearContentRecovery(threadKey)
+			b.log.Info().Int64("tid", threadKey).Msg("confirmed non-marketplace thread")
+		}
+	}
+	b.enqueue(func() { b.processTable(b.ctx, resp) })
 }
 
 func responseConfirmsNonMarketplace(tbl *table.LSTable, threadKey int64) bool {
@@ -1175,7 +1176,6 @@ func (b *bot) buildPrompt(threadID int64) string {
 
 const maxRepliedMessageIDs = 10000
 
-// alreadyReplied reports whether key (a "threadID:messageID" pair) has already been replied to.
 func (b *bot) alreadyReplied(key string) bool {
 	b.repliedMsgIDsMu.Lock()
 	defer b.repliedMsgIDsMu.Unlock()
@@ -1691,8 +1691,6 @@ func sleepContext(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// humanReplyDelay sleeps a randomized interval before sending, so replies read as a quick but
-// normal human response time rather than an instant bot reply.
 func humanReplyDelay(ctx context.Context) bool {
 	d := 3*time.Second + time.Duration(rand.Int63n(int64(5*time.Second)))
 	return sleepContext(ctx, d)
