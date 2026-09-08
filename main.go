@@ -1520,10 +1520,10 @@ func (b *bot) recordSelfSent(id string) {
 func loadSelfSentIDs(path string) (map[string]bool, error) {
 	ids := make(map[string]bool)
 	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return ids, nil
+	}
 	if err != nil {
-		if os.IsNotExist(err) {
-			return ids, nil
-		}
 		return nil, err
 	}
 	for _, line := range strings.Split(string(data), "\n") {
@@ -1538,10 +1538,10 @@ func loadSelfSentIDs(path string) (map[string]bool, error) {
 func loadUserThreads(path string) (map[int64]bool, error) {
 	threads := make(map[int64]bool)
 	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return threads, nil
+	}
 	if err != nil {
-		if os.IsNotExist(err) {
-			return threads, nil
-		}
 		return nil, err
 	}
 	for _, line := range strings.Split(string(data), "\n") {
@@ -1589,10 +1589,10 @@ func (b *bot) recordUserThread(threadID int64) {
 func loadRepliedRules(path string) (map[int64]map[string]bool, error) {
 	replied := make(map[int64]map[string]bool)
 	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return replied, nil
+	}
 	if err != nil {
-		if os.IsNotExist(err) {
-			return replied, nil
-		}
 		return nil, err
 	}
 	if len(bytes.TrimSpace(data)) == 0 {
