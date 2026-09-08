@@ -758,14 +758,14 @@ func (b *bot) restartMessenger() {
 		if !sleepContext(ctx, backoff) {
 			return
 		}
-		if err := b.client.Connect(ctx); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			b.log.Err(err).Msg("failed to restart messenger connection, retrying")
-			continue
+		err := b.client.Connect(ctx)
+		if err == nil {
+			return
 		}
-		return
+		if ctx.Err() != nil {
+			return
+		}
+		b.log.Err(err).Msg("failed to restart messenger connection, retrying")
 	}
 }
 
@@ -1395,15 +1395,16 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 		// Only record the reply (cooldown, replied-once, message-dedup) once it's actually
 		// sent - marking it beforehand meant a failed send (e.g. a reconnect racing the
 		// send) would permanently mark the message as handled despite never answering it.
-		if b.sendReply(ctx, threadID, rule.Reply) {
-			if b.replyOnce {
-				b.recordRuleReply(threadID, rule.Pattern)
-			}
-			b.repliedMu.Lock()
-			b.lastReplyAt[threadID] = time.Now()
-			b.repliedMu.Unlock()
-			b.markReplied(msgKey)
+		if !b.sendReply(ctx, threadID, rule.Reply) {
+			return
 		}
+		if b.replyOnce {
+			b.recordRuleReply(threadID, rule.Pattern)
+		}
+		b.repliedMu.Lock()
+		b.lastReplyAt[threadID] = time.Now()
+		b.repliedMu.Unlock()
+		b.markReplied(msgKey)
 		return
 	}
 	b.log.Info().Int64("tid", threadID).Str("text", text).Msg("no rule matched")
@@ -1952,16 +1953,16 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 			Int64("thread", tid).
 			Str("pattern", rule.Pattern).
 			Msg("auto-replying (e2ee)")
-
-		if b.sendE2EEReply(fbMsg.Info, tid, rule.Reply) {
-			if b.replyOnce {
-				b.recordRuleReply(tid, rule.Pattern)
-			}
-			b.repliedMu.Lock()
-			b.lastReplyAt[tid] = time.Now()
-			b.repliedMu.Unlock()
-			b.markReplied(msgKey)
+		if !b.sendE2EEReply(fbMsg.Info, tid, rule.Reply) {
+			return
 		}
+		if b.replyOnce {
+			b.recordRuleReply(tid, rule.Pattern)
+		}
+		b.repliedMu.Lock()
+		b.lastReplyAt[tid] = time.Now()
+		b.repliedMu.Unlock()
+		b.markReplied(msgKey)
 		return
 	}
 	b.log.Info().Int64("tid", tid).Str("text", text).Msg("e2ee no rule matched")
