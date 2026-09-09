@@ -87,12 +87,11 @@ func (f *logFilter) write(p []byte, lvl zerolog.Level) (n int, err error) {
 	// Writers conventionally report the number of input bytes consumed. Redaction changes the
 	// output length, but the complete original event was handled even when its replacement is
 	// shorter.
-	var writeErr error
 	if lw, ok := f.out.(zerolog.LevelWriter); ok {
-		_, writeErr = lw.WriteLevel(lvl, output)
-	} else {
-		_, writeErr = f.out.Write(output)
+		_, writeErr := lw.WriteLevel(lvl, output)
+		return len(p), writeErr
 	}
+	_, writeErr := f.out.Write(output)
 	return len(p), writeErr
 }
 
