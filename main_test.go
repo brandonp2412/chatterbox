@@ -12,6 +12,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
+	waTypes "go.mau.fi/whatsmeow/types"
 )
 
 func TestLogFilterRedactsPII(t *testing.T) {
@@ -379,6 +380,31 @@ func TestSleepContextCancelsImmediately(t *testing.T) {
 	cancel()
 	if sleepContext(ctx, time.Hour) {
 		t.Fatal("sleepContext reported completion after cancellation")
+	}
+}
+
+func TestE2EEStartupGraceAndReadReceiptTimestamp(t *testing.T) {
+	start := time.Date(2026, time.September, 10, 20, 0, 0, 0, time.UTC)
+	if e2eeMessageTooOld(start.Add(-90*time.Second), start) {
+		t.Fatal("message inside startup grace period was treated as old")
+	}
+	if !e2eeMessageTooOld(start.Add(-3*time.Minute), start) {
+		t.Fatal("message outside startup grace period was not treated as old")
+	}
+	if e2eeMessageTooOld(time.Time{}, start) {
+		t.Fatal("message with missing timestamp was treated as old")
+	}
+
+	messageTime := start.Add(-30 * time.Second)
+	if got := e2eeReadReceiptTimestamp(waTypes.MessageInfo{Timestamp: messageTime}); !got.Equal(messageTime) {
+		t.Fatalf("read receipt timestamp = %v, want source timestamp %v", got, messageTime)
+	}
+
+	before := time.Now()
+	got := e2eeReadReceiptTimestamp(waTypes.MessageInfo{})
+	after := time.Now()
+	if got.Before(before) || got.After(after) {
+		t.Fatalf("zero source timestamp fallback = %v, want current time between %v and %v", got, before, after)
 	}
 }
 

@@ -603,7 +603,10 @@ type bot struct {
 
 // selfEchoGracePeriod bounds how long after we send a reply we'll treat any echo of our own
 // message landing in that thread as ours, even if its ID doesn't match what we sent.
-const selfEchoGracePeriod = 30 * time.Second
+const (
+	selfEchoGracePeriod       = 30 * time.Second
+	startupMessageGracePeriod = 2 * time.Minute
+)
 
 type awaitingContentState struct {
 	armedAt             time.Time
@@ -1083,7 +1086,7 @@ func (b *bot) processTable(ctx context.Context, tbl *table.LSTable) {
 	// persisting them to disk (a restart with an empty/pre-persistence ID file used to
 	// re-mark old threads as user-participated purely from replaying their own history).
 	isRecent := func(timestampMs int64) bool {
-		return timestampMs >= b.startTime.Add(-2*time.Minute).UnixMilli()
+		return timestampMs >= b.startTime.Add(-startupMessageGracePeriod).UnixMilli()
 	}
 	for _, msg := range tbl.LSUpsertMessage {
 		if msg.SenderId == b.userID && isRecent(msg.TimestampMs) && !isSelfSent(msg.MessageId, msg.OfflineThreadingId) && !recentlySelfReplied(msg.ThreadKey) {
@@ -1223,7 +1226,7 @@ func (b *bot) threadNeedsClassification(threadKey int64) bool {
 // backlog or an established personal conversation cannot be reclassified.
 func (b *bot) classifyMarketplaceGreeting(msg *table.WrappedMessage) bool {
 	if msg.SenderId == b.userID ||
-		msg.TimestampMs < b.startTime.Add(-2*time.Minute).UnixMilli() ||
+		msg.TimestampMs < b.startTime.Add(-startupMessageGracePeriod).UnixMilli() ||
 		!strings.Contains(msg.Text, marketplaceAvailabilityGreeting) {
 		return false
 	}
@@ -1263,7 +1266,7 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 		// inquiry forever. A current inbound text is enough reason to fetch the complete thread
 		// row; replies remain blocked until that fetch proves it is Marketplace.
 		if msg.Text != "" && msg.SenderId != b.userID &&
-			msg.TimestampMs >= b.startTime.Add(-2*time.Minute).UnixMilli() &&
+			msg.TimestampMs >= b.startTime.Add(-startupMessageGracePeriod).UnixMilli() &&
 			b.threadNeedsClassification(threadID) {
 			b.armClassificationRecovery(threadID)
 			b.log.Info().Int64("tid", threadID).Msg("generic thread has inbound message, scheduling classification fetch")
@@ -1281,7 +1284,7 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 		return
 	}
 
-	if msg.TimestampMs < b.startTime.Add(-2*time.Minute).UnixMilli() {
+	if msg.TimestampMs < b.startTime.Add(-startupMessageGracePeriod).UnixMilli() {
 		b.log.Info().Int64("tid", threadID).Int64("ts", msg.TimestampMs).Msg("skipping old message")
 		return
 	}
@@ -1842,7 +1845,7 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 		return
 	}
 
-	if fbMsg.Info.Timestamp.Before(b.startTime) {
+	if e2eeMessageTooOld(fbMsg.Info.Timestamp, b.startTime) {
 		b.log.Info().Int64("tid", tid).Time("msg_ts", fbMsg.Info.Timestamp).Time("start_ts", b.startTime).Msg("e2ee: skipping old message")
 		return
 	}
@@ -2026,11 +2029,22 @@ func (b *bot) sendE2EEReply(srcInfo waTypes.MessageInfo, threadID int64, text st
 	return true
 }
 
+func e2eeMessageTooOld(timestamp, startTime time.Time) bool {
+	return !timestamp.IsZero() && timestamp.Before(startTime.Add(-startupMessageGracePeriod))
+}
+
+func e2eeReadReceiptTimestamp(srcInfo waTypes.MessageInfo) time.Time {
+	if !srcInfo.Timestamp.IsZero() {
+		return srcInfo.Timestamp
+	}
+	return time.Now()
+}
+
 func (b *bot) markE2EEThreadRead(threadID int64, srcInfo waTypes.MessageInfo) {
 	if b.waClient == nil {
 		return
 	}
-	if err := b.waClient.MarkRead(b.context(), []waTypes.MessageID{srcInfo.ID}, time.Now(), srcInfo.Chat, srcInfo.Sender); err != nil {
+	if err := b.waClient.MarkRead(b.context(), []waTypes.MessageID{srcInfo.ID}, e2eeReadReceiptTimestamp(srcInfo), srcInfo.Chat, srcInfo.Sender); err != nil {
 		b.log.Err(err).Int64("tid", threadID).Msg("failed to mark e2ee thread read")
 	}
 }
