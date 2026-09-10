@@ -1178,6 +1178,13 @@ func (b *bot) buildPrompt(threadID int64) string {
 
 const maxRepliedMessageIDs = 10000
 
+func replyDedupKey(threadID, senderID, timestampMs int64, messageID, text string) string {
+	if messageID != "" {
+		return fmt.Sprintf("%d:%s", threadID, messageID)
+	}
+	return fmt.Sprintf("%d:%d:%d:%s", threadID, senderID, timestampMs, text)
+}
+
 func (b *bot) alreadyReplied(key string) bool {
 	b.repliedMsgIDsMu.Lock()
 	defer b.repliedMsgIDsMu.Unlock()
@@ -1293,13 +1300,7 @@ func (b *bot) processMessage(ctx context.Context, msg *table.WrappedMessage) {
 	// empty MessageId, which used to bypass this dedup entirely and caused the same message to
 	// get replied to again once the cooldown had cleared. Fall back to sender+timestamp+text:
 	// redelivery preserves the original timestamp, while a genuine repeat later remains distinct.
-	msgKey := fmt.Sprintf("%d:%s", threadID, msg.MessageId)
-	if msg.MessageId == "" {
-		// A redelivery keeps the original timestamp, while a genuine repeat of identical text
-		// later has a different one. Including it avoids suppressing legitimate repeat messages
-		// forever just because this delivery path omitted MessageId.
-		msgKey = fmt.Sprintf("%d:%d:%d:%s", threadID, msg.SenderId, msg.TimestampMs, msg.Text)
-	}
+	msgKey := replyDedupKey(threadID, msg.SenderId, msg.TimestampMs, msg.MessageId, msg.Text)
 	if b.alreadyReplied(msgKey) {
 		b.log.Info().Int64("tid", threadID).Str("message_id", msg.MessageId).Msg("skipping already-replied message")
 		return
@@ -1850,10 +1851,13 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 		return
 	}
 
-	msgKey := fmt.Sprintf("%d:%s", tid, fbMsg.Info.ID)
-	if fbMsg.Info.ID != "" && b.alreadyReplied(msgKey) {
-		b.log.Info().Int64("tid", tid).Str("message_id", fbMsg.Info.ID).Msg("e2ee: skipping already-replied message")
-		return
+	var msgKey string
+	if fbMsg.Info.ID != "" {
+		msgKey = replyDedupKey(tid, sid, fbMsg.Info.Timestamp.UnixMilli(), fbMsg.Info.ID, "")
+		if b.alreadyReplied(msgKey) {
+			b.log.Info().Int64("tid", tid).Str("message_id", fbMsg.Info.ID).Msg("e2ee: skipping already-replied message")
+			return
+		}
 	}
 
 	if fbMsg.Info.IsFromMe {
@@ -1909,6 +1913,13 @@ func (b *bot) handleE2EEMessage(fbMsg *waEvents.FBMessage) {
 	if text == "" {
 		b.log.Info().Int64("tid", tid).Str("content_type", fmt.Sprintf("%T", content.GetContent())).Msg("e2ee: empty text, skipping")
 		return
+	}
+	if msgKey == "" {
+		msgKey = replyDedupKey(tid, sid, fbMsg.Info.Timestamp.UnixMilli(), "", text)
+		if b.alreadyReplied(msgKey) {
+			b.log.Info().Int64("tid", tid).Msg("e2ee: skipping already-replied message without message ID")
+			return
+		}
 	}
 	b.clearContentRecovery(tid)
 

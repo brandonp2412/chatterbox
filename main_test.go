@@ -354,6 +354,21 @@ func TestLoadConfigRejectsInvalidValues(t *testing.T) {
 	}
 }
 
+func TestReplyDedupKeyFallsBackWhenMessageIDMissing(t *testing.T) {
+	withID := replyDedupKey(42, 7, 1234, "message-1", "hello")
+	if withID != "42:message-1" {
+		t.Fatalf("dedup key with message ID = %q", withID)
+	}
+
+	withoutID := replyDedupKey(42, 7, 1234, "", "hello")
+	if withoutID != "42:7:1234:hello" {
+		t.Fatalf("dedup fallback key = %q", withoutID)
+	}
+	if withoutID == replyDedupKey(42, 7, 1235, "", "hello") {
+		t.Fatal("genuine later repeat was collapsed into the same fallback key")
+	}
+}
+
 func TestRepliedMessageDedupIsBounded(t *testing.T) {
 	b := &bot{repliedMsgIDs: make(map[string]struct{})}
 	for i := 0; i < maxRepliedMessageIDs+25; i++ {
