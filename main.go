@@ -262,6 +262,13 @@ func parseArgs(args []string) (cliOptions, error) {
 	return opts, nil
 }
 
+func effectiveLogLevel(level zerolog.Level, selfTest bool) zerolog.Level {
+	if selfTest && level > zerolog.DebugLevel {
+		return zerolog.DebugLevel
+	}
+	return level
+}
+
 func run() error {
 	opts, err := parseArgs(os.Args[1:])
 	if err != nil {
@@ -289,9 +296,7 @@ func run() error {
 	if err != nil {
 		lvl = zerolog.InfoLevel
 	}
-	if selfTest && lvl < zerolog.DebugLevel {
-		lvl = zerolog.DebugLevel
-	}
+	lvl = effectiveLogLevel(lvl, selfTest)
 	redactPII := lvl > zerolog.DebugLevel
 	log := zerolog.New(&logFilter{
 		out:       zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: "3:04PM"},

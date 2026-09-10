@@ -228,6 +228,28 @@ func TestMarketplaceGreetingFallback(t *testing.T) {
 	}
 }
 
+func TestEffectiveLogLevelEnablesDebugForDevMode(t *testing.T) {
+	tests := []struct {
+		name     string
+		level    zerolog.Level
+		selfTest bool
+		want     zerolog.Level
+	}{
+		{name: "info dev", level: zerolog.InfoLevel, selfTest: true, want: zerolog.DebugLevel},
+		{name: "warn dev", level: zerolog.WarnLevel, selfTest: true, want: zerolog.DebugLevel},
+		{name: "trace dev remains trace", level: zerolog.TraceLevel, selfTest: true, want: zerolog.TraceLevel},
+		{name: "info normal", level: zerolog.InfoLevel, selfTest: false, want: zerolog.InfoLevel},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := effectiveLogLevel(tc.level, tc.selfTest); got != tc.want {
+				t.Fatalf("effectiveLogLevel(%s, %v) = %s, want %s", tc.level, tc.selfTest, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestLogFilterKeepsPIIAtDebugLogLevel(t *testing.T) {
 	var output bytes.Buffer
 	log := zerolog.New(&logFilter{out: &output, redactPII: false}).Level(zerolog.DebugLevel)
