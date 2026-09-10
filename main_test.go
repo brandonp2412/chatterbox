@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -383,8 +384,11 @@ func TestReplyDedupKeyFallsBackWhenMessageIDMissing(t *testing.T) {
 	}
 
 	withoutID := replyDedupKey(42, 7, 1234, "", "hello")
-	if withoutID != "42:7:1234:hello" {
-		t.Fatalf("dedup fallback key = %q", withoutID)
+	if strings.Contains(withoutID, "hello") {
+		t.Fatalf("dedup fallback key leaked message text: %q", withoutID)
+	}
+	if withoutID != replyDedupKey(42, 7, 1234, "", "hello") {
+		t.Fatal("identical fallback inputs did not produce a stable key")
 	}
 	if withoutID == replyDedupKey(42, 7, 1235, "", "hello") {
 		t.Fatal("genuine later repeat was collapsed into the same fallback key")
@@ -404,6 +408,59 @@ func TestRepliedMessageDedupIsBounded(t *testing.T) {
 	}
 	if !b.alreadyReplied(fmt.Sprintf("message-%d", maxRepliedMessageIDs+24)) {
 		t.Fatal("newest dedup entry was unexpectedly missing")
+	}
+}
+
+func TestRepliedMessageDedupPersistsAcrossRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "replied_message_ids.json")
+	first := &bot{
+		log:               zerolog.Nop(),
+		repliedMsgIDs:     make(map[string]struct{}),
+		repliedMsgIDsPath: path,
+	}
+	const key = "42:7:1234:buyer message\nwith newline"
+	first.markReplied(key)
+
+	ids, order, err := loadRepliedMessageIDs(path)
+	if err != nil {
+		t.Fatalf("loadRepliedMessageIDs() error = %v", err)
+	}
+	second := &bot{repliedMsgIDs: ids, repliedMsgIDOrder: order}
+	if !second.alreadyReplied(key) {
+		t.Fatal("persisted replied-message ID was lost across restart")
+	}
+	if len(order) != 1 || order[0] != key {
+		t.Fatalf("unexpected persisted dedup order: %q", order)
+	}
+}
+
+func TestLoadRepliedMessageIDsKeepsNewestBoundedEntries(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "replied_message_ids.json")
+	entries := make([]string, 0, maxRepliedMessageIDs+2)
+	for i := 0; i < maxRepliedMessageIDs+1; i++ {
+		entries = append(entries, fmt.Sprintf("message-%d", i))
+	}
+	entries = append(entries, "message-1")
+	data, err := json.Marshal(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	ids, order, err := loadRepliedMessageIDs(path)
+	if err != nil {
+		t.Fatalf("loadRepliedMessageIDs() error = %v", err)
+	}
+	if len(ids) != maxRepliedMessageIDs || len(order) != maxRepliedMessageIDs {
+		t.Fatalf("loaded dedup size = %d/%d, want %d", len(ids), len(order), maxRepliedMessageIDs)
+	}
+	if _, exists := ids["message-0"]; exists {
+		t.Fatal("oldest persisted dedup entry was not evicted")
+	}
+	if _, exists := ids["message-1"]; !exists {
+		t.Fatal("newest duplicate was unexpectedly discarded")
 	}
 }
 

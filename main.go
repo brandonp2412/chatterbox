@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -429,6 +430,12 @@ func run() error {
 	}
 	log.Info().Int("count", len(repliedRules)).Msg("loaded replied-rule threads")
 
+	repliedMsgIDs, repliedMsgIDOrder, err := loadRepliedMessageIDs(repliedMsgIDsFile)
+	if err != nil {
+		return fmt.Errorf("failed to load replied message ids: %w", err)
+	}
+	log.Info().Int("count", len(repliedMsgIDs)).Msg("loaded replied-message ids")
+
 	bot := &bot{
 		log:                      log,
 		client:                   mc,
@@ -443,7 +450,9 @@ func run() error {
 		lastReplyAt:              make(map[int64]time.Time),
 		replyCooldown:            replyCooldown,
 		selfSentOtids:            selfSentOtids,
-		repliedMsgIDs:            make(map[string]struct{}),
+		repliedMsgIDs:            repliedMsgIDs,
+		repliedMsgIDOrder:        repliedMsgIDOrder,
+		repliedMsgIDsPath:        repliedMsgIDsFile,
 		listings:                 make(map[int64]*listing),
 		threadTypes:              make(map[int64]table.ThreadType),
 		authoritativeThreadTypes: make(map[int64]bool),
@@ -578,6 +587,7 @@ type bot struct {
 	// on that thread has expired.
 	repliedMsgIDs     map[string]struct{}
 	repliedMsgIDOrder []string
+	repliedMsgIDsPath string
 	repliedMsgIDsMu   sync.Mutex
 
 	listings    map[int64]*listing
@@ -1187,7 +1197,10 @@ func replyDedupKey(threadID, senderID, timestampMs int64, messageID, text string
 	if messageID != "" {
 		return fmt.Sprintf("%d:%s", threadID, messageID)
 	}
-	return fmt.Sprintf("%d:%d:%d:%s", threadID, senderID, timestampMs, text)
+	// The fallback is persisted across restarts, so hash message text instead of writing a
+	// buyer's message content to disk. Timestamp keeps genuine later repeats distinct.
+	textHash := sha256.Sum256([]byte(text))
+	return fmt.Sprintf("%d:%d:%d:%x", threadID, senderID, timestampMs, textHash)
 }
 
 func (b *bot) alreadyReplied(key string) bool {
@@ -1203,17 +1216,30 @@ func (b *bot) markReplied(key string) {
 	}
 	b.repliedMsgIDsMu.Lock()
 	defer b.repliedMsgIDsMu.Unlock()
+	if b.repliedMsgIDs == nil {
+		b.repliedMsgIDs = make(map[string]struct{})
+	}
 	if _, exists := b.repliedMsgIDs[key]; exists {
 		return
 	}
 	b.repliedMsgIDs[key] = struct{}{}
 	b.repliedMsgIDOrder = append(b.repliedMsgIDOrder, key)
-	if len(b.repliedMsgIDOrder) <= maxRepliedMessageIDs {
+	if len(b.repliedMsgIDOrder) > maxRepliedMessageIDs {
+		oldest := b.repliedMsgIDOrder[0]
+		b.repliedMsgIDOrder = b.repliedMsgIDOrder[1:]
+		delete(b.repliedMsgIDs, oldest)
+	}
+	if b.repliedMsgIDsPath == "" {
 		return
 	}
-	oldest := b.repliedMsgIDOrder[0]
-	b.repliedMsgIDOrder = b.repliedMsgIDOrder[1:]
-	delete(b.repliedMsgIDs, oldest)
+	data, err := json.Marshal(b.repliedMsgIDOrder)
+	if err != nil {
+		b.log.Err(err).Msg("failed to encode replied-message state")
+		return
+	}
+	if err := writeFileAtomic(b.repliedMsgIDsPath, data, 0600); err != nil {
+		b.log.Err(err).Msg("failed to persist replied-message state")
+	}
 }
 
 func (b *bot) marketplaceThread(threadKey int64) bool {
@@ -1494,9 +1520,10 @@ func (b *bot) callDeepseek(ctx context.Context, systemPrompt, userMessage string
 }
 
 const (
-	selfSentIDsFile  = "self_sent_ids.txt"
-	userThreadsFile  = "user_threads.txt"
-	repliedRulesFile = "replied_rules.json"
+	selfSentIDsFile   = "self_sent_ids.txt"
+	userThreadsFile   = "user_threads.txt"
+	repliedRulesFile  = "replied_rules.json"
+	repliedMsgIDsFile = "replied_message_ids.json"
 )
 
 // recordSelfSent marks id as one of our own sent messages, both in memory and durably on disk.
@@ -1524,6 +1551,45 @@ func (b *bot) recordSelfSent(id string) {
 	if _, err := f.WriteString(id + "\n"); err != nil {
 		b.log.Err(err).Msg("failed to persist self-sent message id")
 	}
+}
+
+func loadRepliedMessageIDs(path string) (map[string]struct{}, []string, error) {
+	ids := make(map[string]struct{})
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return ids, nil, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		return ids, nil, nil
+	}
+
+	var persisted []string
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		return nil, nil, fmt.Errorf("failed to parse persisted replied message ids: %w", err)
+	}
+
+	// Walk newest-to-oldest so duplicate/corrupt historical entries retain the newest copy,
+	// while keeping the same bounded memory/disk footprint as the live cache.
+	reversed := make([]string, 0, min(len(persisted), maxRepliedMessageIDs))
+	for i := len(persisted) - 1; i >= 0 && len(reversed) < maxRepliedMessageIDs; i-- {
+		key := persisted[i]
+		if key == "" {
+			continue
+		}
+		if _, exists := ids[key]; exists {
+			continue
+		}
+		ids[key] = struct{}{}
+		reversed = append(reversed, key)
+	}
+	order := make([]string, len(reversed))
+	for i := range reversed {
+		order[len(reversed)-1-i] = reversed[i]
+	}
+	return ids, order, nil
 }
 
 func loadSelfSentIDs(path string) (map[string]bool, error) {
