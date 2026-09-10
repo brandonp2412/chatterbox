@@ -480,11 +480,14 @@ func run() error {
 		}
 	}()
 
-	go func() {
-		if err := waClient.Connect(); err != nil {
-			log.Err(err).Msg("Failed to connect e2ee socket")
-		}
-	}()
+	go connectWithRetry(
+		ctx,
+		log,
+		"e2ee socket",
+		waClient.Connect,
+		e2eeConnectInitialBackoff,
+		e2eeConnectMaxBackoff,
+	)
 
 	go bot.contentRecoveryLoop(ctx)
 
@@ -1750,6 +1753,44 @@ func threadReadConfirmed(resp *table.LSTable, threadID int64) bool {
 		}
 	}
 	return false
+}
+
+const (
+	e2eeConnectInitialBackoff = 5 * time.Second
+	e2eeConnectMaxBackoff     = time.Minute
+)
+
+func connectWithRetry(
+	ctx context.Context,
+	log zerolog.Logger,
+	name string,
+	connect func() error,
+	initialBackoff time.Duration,
+	maxBackoff time.Duration,
+) {
+	if initialBackoff <= 0 {
+		initialBackoff = time.Millisecond
+	}
+	if maxBackoff < initialBackoff {
+		maxBackoff = initialBackoff
+	}
+	backoff := initialBackoff
+	for ctx.Err() == nil {
+		if err := connect(); err == nil {
+			return
+		} else {
+			log.Err(err).Dur("retry_in", backoff).Msg("failed to connect " + name)
+		}
+		if !sleepContext(ctx, backoff) {
+			return
+		}
+		if backoff < maxBackoff {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
 }
 
 func sleepContext(ctx context.Context, d time.Duration) bool {

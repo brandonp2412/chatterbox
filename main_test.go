@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -474,6 +475,47 @@ func TestSleepContextCancelsImmediately(t *testing.T) {
 	cancel()
 	if sleepContext(ctx, time.Hour) {
 		t.Fatal("sleepContext reported completion after cancellation")
+	}
+}
+
+func TestConnectWithRetryRecoversFromTransientFailures(t *testing.T) {
+	attempts := 0
+	connectWithRetry(
+		context.Background(),
+		zerolog.Nop(),
+		"test socket",
+		func() error {
+			attempts++
+			if attempts < 3 {
+				return errors.New("temporary failure")
+			}
+			return nil
+		},
+		time.Millisecond,
+		2*time.Millisecond,
+	)
+	if attempts != 3 {
+		t.Fatalf("connect attempts = %d, want 3", attempts)
+	}
+}
+
+func TestConnectWithRetryStopsOnCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	attempts := 0
+	connectWithRetry(
+		ctx,
+		zerolog.Nop(),
+		"test socket",
+		func() error {
+			attempts++
+			cancel()
+			return errors.New("still offline")
+		},
+		time.Hour,
+		time.Hour,
+	)
+	if attempts != 1 {
+		t.Fatalf("connect attempts = %d, want 1", attempts)
 	}
 }
 
