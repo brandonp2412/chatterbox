@@ -214,6 +214,7 @@ func main() {
 
 type cliOptions struct {
 	selfTest      bool
+	showHelp      bool
 	cfgPath       string
 	testThread    int64
 	devContactIDs map[int64]bool
@@ -228,6 +229,8 @@ func parseArgs(args []string) (cliOptions, error) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
+		case a == "-h" || a == "--help":
+			opts.showHelp = true
 		case a == "--dev":
 			opts.selfTest = true
 		case a == "--test":
@@ -274,6 +277,10 @@ func run() error {
 	opts, err := parseArgs(os.Args[1:])
 	if err != nil {
 		return err
+	}
+	if opts.showHelp {
+		fmt.Println("Usage: chatterbox [--dev] [--test THREAD_ID] [--dev-contact CONTACT_ID] [config.yaml]")
+		return nil
 	}
 	selfTest := opts.selfTest
 	cfgPath := opts.cfgPath

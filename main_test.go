@@ -297,6 +297,16 @@ func TestParseArgs(t *testing.T) {
 		t.Fatalf("unexpected parsed options: %+v", opts)
 	}
 
+	for _, args := range [][]string{{"-h"}, {"--help"}} {
+		helpOpts, err := parseArgs(args)
+		if err != nil {
+			t.Fatalf("parseArgs(%q) error = %v", args, err)
+		}
+		if !helpOpts.showHelp {
+			t.Fatalf("parseArgs(%q) did not enable help", args)
+		}
+	}
+
 	for _, args := range [][]string{
 		{"--unknown"},
 		{"--test", "0"},
