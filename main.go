@@ -350,7 +350,7 @@ func run() error {
 	if cfg.Proxy != "" {
 		clientSettings, err = clientSettings.WithProxy(cfg.Proxy)
 		if err != nil {
-			return fmt.Errorf("invalid proxy %q: %w", cfg.Proxy, err)
+			return fmt.Errorf("invalid proxy: %s", redactPIIInString(err.Error()))
 		}
 	}
 	mc := messagix.NewClient(c, libLog, &messagix.Config{
