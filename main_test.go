@@ -297,6 +297,14 @@ func TestParseArgs(t *testing.T) {
 		t.Fatalf("unexpected parsed options: %+v", opts)
 	}
 
+	testOnlyOpts, err := parseArgs([]string{"--test", "123"})
+	if err != nil {
+		t.Fatalf("parseArgs(--test) error = %v", err)
+	}
+	if !testOnlyOpts.selfTest || testOnlyOpts.testThread != 123 {
+		t.Fatalf("--test should enable self-test mode: %+v", testOnlyOpts)
+	}
+
 	for _, args := range [][]string{{"-h"}, {"--help"}} {
 		helpOpts, err := parseArgs(args)
 		if err != nil {

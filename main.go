@@ -243,6 +243,7 @@ func parseArgs(args []string) (cliOptions, error) {
 				return cliOptions{}, fmt.Errorf("invalid thread ID %q: must be a positive integer", args[i])
 			}
 			opts.testThread = v
+			opts.selfTest = true
 		case a == "--dev-contact":
 			i++
 			if i >= len(args) {
