@@ -9,3 +9,6 @@ self_sent_ids.txt
 user_threads.txt
 replied_rules.json
 device.db-*
+
+# Local Serena agent state
+.serena/
